@@ -1,16 +1,14 @@
 """
-Universal AI Proxy  v8.1
+Universal AI Proxy  v7.0
 =========================
-بروكسي موحد يدعم أربعة نماذج:
+بروكسي موحد يدعم ثلاثة نماذج:
   ① Qwen           — عبر chat.qwen.ai
   ② DeepSeek Expert — عبر chat.deepseek.com (model_type=expert)
   ③ DeepSeek Default— عبر chat.deepseek.com (model_type=default)
-  ④ Database        — عبر qcpujeurnkbvwlvmylyx.supabase.co (Gemini, GPT, Claude)
 
-تغييرات v8.1:
-  • حذف GPT backend نهائياً
-  • إصلاح Database: تنظيف messages قبل الإرسال (إزالة حقول thinking وغيرها)
-  • إصلاح Database: تحويل system messages إلى user message أول
+إصلاحات v7.0:
+  • conv_id ثابت بناءً على أول رسالة في المحادثة (لا يتغير مع الرسائل الجديدة)
+  • نموذجان منفصلان لـ DeepSeek: "deepseek" (expert) و "deepseek-default"
 """
 
 from __future__ import annotations
@@ -90,15 +88,27 @@ async def _evict_old_sessions() -> None:
 
 
 # ══════════════════════════════════════════════════════════
-# conv_id ثابت
+# ★ conv_id ثابت — الحل الجوهري
+#
+# المشكلة: OpenMinis لا يرسل conversation_id ثابت،
+# فكنا نحسبه من الرسائل وهو يتغير مع كل رسالة جديدة.
+#
+# الحل: نحسب conv_id من أول رسالة فقط (anchor) فيبقى
+# ثابتاً طوال المحادثة بغض النظر عن عدد الرسائل.
 # ══════════════════════════════════════════════════════════
 
 def _compute_conv_id(
     messages: List[Dict],
     explicit_id: Optional[str] = None,
 ) -> str:
+    """
+    إذا أرسل العميل conversation_id صريح → نستخدمه.
+    وإلا → نحسبه من أول رسالة فقط (لا تتغير).
+    """
     if explicit_id:
         return explicit_id
+
+    # أول رسالة في المحادثة = المرساة الثابتة
     anchor = messages[:1] if messages else [{"role": "user", "content": "init"}]
     raw    = json.dumps(anchor, ensure_ascii=False, sort_keys=True)
     return "conv_" + hashlib.md5(raw.encode()).hexdigest()
@@ -268,6 +278,7 @@ def parse_tool_call(text: str) -> Optional[Dict]:
     if m:
         return _make_tc(m.group(1), m.group(2))
 
+    # Branch 3: XML parameters style (من v6)
     m_name   = re.search(r"<name>(.*?)</name>", text, re.IGNORECASE)
     m_params = re.findall(
         r"<parameter[=:](\w+)>\s*(.*?)\s*</parameter>",
@@ -527,6 +538,13 @@ register_backend(QwenBackend())
 
 # ══════════════════════════════════════════════════════════
 # BACKEND 2 & 3: DeepSeek (Expert + Default)
+#
+# ★ الإصلاح الرئيسي: conv_id ثابت = لا نُنشئ جلسة جديدة
+#   إلا عند أول رسالة في المحادثة.
+#
+# ★ نموذجان:
+#   "deepseek"         → model_type=expert  (الافتراضي الأقوى)
+#   "deepseek-default" → model_type=default (السريع)
 # ══════════════════════════════════════════════════════════
 
 DEEPSEEK_PROXY_ID_EXPERT  = "deepseek"
@@ -607,8 +625,14 @@ async def _ds_create_session(token: str, client: httpx.AsyncClient) -> str:
 
 
 class DeepSeekBackend(BaseBackend):
+    """
+    Backend عام لـ DeepSeek — يُنشئ نموذجين:
+      deepseek         → expert
+      deepseek-default → default
+    """
+
     def __init__(self, proxy_id: str, model_type: str):
-        self._proxy_id   = proxy_id
+        self._proxy_id  = proxy_id
         self._model_type = model_type
 
     @property
@@ -616,6 +640,7 @@ class DeepSeekBackend(BaseBackend):
         return self._proxy_id
 
     async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
+        # model_type: يمكن تجاوزه من extra لكن الافتراضي من النموذج نفسه
         model_type     = extra.get("model_type", self._model_type)
         search_enabled = extra.get("search_enabled", True)
 
@@ -625,6 +650,7 @@ class DeepSeekBackend(BaseBackend):
 
         await _evict_old_sessions()
 
+        # ★ الإصلاح: conv_id ثابت → نُنشئ جلسة DeepSeek مرة واحدة فقط
         sess = await _get_session(token, conv_id)
         async with httpx.AsyncClient() as client:
             if sess:
@@ -633,6 +659,7 @@ class DeepSeekBackend(BaseBackend):
                 log.info("DeepSeek[%s]: reusing session=%s parent=%s",
                          model_type, session_id, parent_message_id)
             else:
+                # أول مرة في هذه المحادثة → ننشئ جلسة واحدة
                 session_id        = await _ds_create_session(token, client)
                 parent_message_id = None
                 await _set_session(token, conv_id, {
@@ -714,6 +741,7 @@ class DeepSeekBackend(BaseBackend):
                 yield "data: [DONE]\n\n"
                 return
 
+        # حفظ parent_message_id الجديد للرسالة التالية
         if new_parent_msg_id:
             await _update_session(token, conv_id, ds_parent_msg_id=new_parent_msg_id)
 
@@ -738,230 +766,9 @@ class DeepSeekBackend(BaseBackend):
             yield "data: [DONE]\n\n"
 
 
+# تسجيل نموذجين DeepSeek
 register_backend(DeepSeekBackend(DEEPSEEK_PROXY_ID_EXPERT,  "expert"))
 register_backend(DeepSeekBackend(DEEPSEEK_PROXY_ID_DEFAULT, "default"))
-
-
-# ══════════════════════════════════════════════════════════
-# BACKEND 4: Database (Supabase — Gemini / GPT / Claude)
-#
-# التوكن الثابت: "database-key"
-# ══════════════════════════════════════════════════════════
-
-DATABASE_FIXED_TOKEN = "database-key"
-DATABASE_URL         = "https://qcpujeurnkbvwlvmylyx.supabase.co/functions/v1/chat"
-DATABASE_TIMEOUT     = 180
-
-DATABASE_MODELS: Dict[str, str] = {
-    "db-gemini-flash":         "google/gemini-2.5-flash",
-    "db-gemini-flash-lite":    "google/gemini-2.5-flash-lite",
-    "db-gemini-pro":           "google/gemini-2.5-pro",
-    "db-gpt-5-nano":           "openai/gpt-5-nano",
-    "db-gpt-5-mini":           "openai/gpt-5-mini",
-    "db-gpt-5":                "openai/gpt-5",
-    "db-claude-haiku":         "anthropic/claude-3-5-haiku-20241022",
-    "db-claude-sonnet":        "anthropic/claude-sonnet-4-5",
-    "db-claude-opus":          "anthropic/claude-opus-4-1-20250805",
-    "db-claude-sonnet-5":      "anthropic/claude-sonnet-5",
-    "db-claude-fable":         "anthropic/claude-fable-5",
-}
-
-_DB_REAL_TO_PROXY: Dict[str, str] = {v: k for k, v in DATABASE_MODELS.items()}
-
-
-def _db_resolve_real_model(model_id: str) -> str:
-    if model_id in DATABASE_MODELS:
-        return DATABASE_MODELS[model_id]
-    if "/" in model_id:
-        return model_id
-    return "google/gemini-2.5-flash"
-
-
-def _db_is_database_token(token: str) -> bool:
-    return token.strip() == DATABASE_FIXED_TOKEN
-
-
-def _content_to_str(content) -> str:
-    """تحويل content من أي صيغة إلى نص"""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for c in content:
-            if isinstance(c, dict):
-                if c.get("type") == "text":
-                    parts.append(c.get("text", ""))
-                elif c.get("type") == "image_url":
-                    parts.append("[IMAGE]")
-            elif isinstance(c, str):
-                parts.append(c)
-        return " ".join(parts).strip()
-    return str(content) if content else ""
-
-
-def _db_prepare(messages: List[Dict]) -> Tuple[Optional[str], List[Dict]]:
-    """
-    يُعيد (system_prompt, clean_messages) للـ Supabase.
-    - system_prompt: نص كامل بدون قطع — يُرسل كـ field منفصل
-    - clean_messages: قائمة {role, content} فقط، تناوب user/assistant، تبدأ بـ user
-    """
-    system_parts: List[str] = []
-    turns: List[Tuple[str, str]] = []
-
-    for m in messages:
-        role    = m.get("role", "user")
-        content = _content_to_str(m.get("content") or "")
-
-        if role == "system":
-            if content.strip():
-                system_parts.append(content.strip())
-        elif role == "user":
-            turns.append(("user", content))
-        elif role == "assistant":
-            text = content.strip()
-            # إذا كانت فارغة (tool_call فقط أو thinking) — تجاهل تماماً
-            if text:
-                turns.append(("assistant", text))
-        # تجاهل tool / function / tool_result / thinking تماماً
-
-    system_prompt: Optional[str] = "\n\n".join(system_parts) if system_parts else None
-
-    # ضمان التناوب — دمج الرسائل المتتالية بنفس الـ role
-    merged: List[Dict] = []
-    for role, content in turns:
-        if merged and merged[-1]["role"] == role:
-            merged[-1]["content"] += "\n\n" + content
-        else:
-            merged.append({"role": role, "content": content})
-
-    # يجب أن تبدأ بـ user
-    if merged and merged[0]["role"] != "user":
-        merged.insert(0, {"role": "user", "content": " "})
-
-    # تأكد أن كل content ليس فارغاً
-    for m in merged:
-        if not m["content"].strip():
-            m["content"] = " "
-
-    if not merged:
-        merged = [{"role": "user", "content": " "}]
-
-    return system_prompt, merged
-
-
-class DatabaseBackend(BaseBackend):
-    def __init__(self, proxy_id: str, real_model: str):
-        self._proxy_id   = proxy_id
-        self._real_model = real_model
-
-    @property
-    def model_id(self) -> str:
-        return self._proxy_id
-
-    async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
-        real_model = _db_resolve_real_model(self._proxy_id)
-
-        # استخراج system prompt والرسائل المنظفة
-        system_prompt, clean_messages = _db_prepare(messages)
-
-        log.info("Database: proxy_id=%s real_model=%s msgs=%d→%d system_len=%d",
-                 self._proxy_id, real_model, len(messages), len(clean_messages),
-                 len(system_prompt) if system_prompt else 0)
-
-        # طباعة بنية كل رسالة خام لتشخيص مشكلة thinking=True
-        for i, m in enumerate(messages):
-            keys = list(m.keys())
-            role = m.get("role","?")
-            clen = len(str(m.get("content") or ""))
-            has_tc = bool(m.get("tool_calls"))
-            log.info("RAW[%d] role=%s keys=%s content_len=%d tool_calls=%s",
-                     i, role, keys, clen, has_tc)
-        log.info("CLEAN msgs=%d: %s",
-                 len(clean_messages),
-                 [(m["role"], len(m["content"])) for m in clean_messages])
-
-        # دمج system في أول رسالة user إذا وُجد
-        if system_prompt and clean_messages:
-            first_user = next((i for i, m in enumerate(clean_messages) if m["role"] == "user"), None)
-            if first_user is not None:
-                clean_messages[first_user]["content"] = (
-                    system_prompt + "\n\n---\n\n" + clean_messages[first_user]["content"]
-                )
-            else:
-                clean_messages.insert(0, {"role": "user", "content": system_prompt})
-        elif system_prompt:
-            clean_messages = [{"role": "user", "content": system_prompt}]
-
-        payload: Dict[str, Any] = {
-            "messages": clean_messages,
-            "model":    real_model,
-        }
-
-        headers = {
-            "Content-Type": "application/json",
-            "Accept":       "text/event-stream",
-        }
-
-        full_text = ""
-
-        try:
-            async with httpx.AsyncClient() as client:
-                async with client.stream(
-                    "POST", DATABASE_URL,
-                    json=payload, headers=headers,
-                    timeout=DATABASE_TIMEOUT,
-                ) as resp:
-                    if resp.status_code >= 400:
-                        err_body = await resp.aread()
-                        err_msg  = err_body.decode("utf-8", errors="replace")
-                        log.error("Database HTTP %d: %s", resp.status_code, err_msg[:200])
-                        yield sse_chunk(
-                            f"[Database Error {resp.status_code}: {err_msg[:100]}]",
-                            model=self._proxy_id,
-                        )
-                        yield sse_chunk(model=self._proxy_id, finish=True)
-                        yield "data: [DONE]\n\n"
-                        return
-
-                    async for raw_line in resp.aiter_lines():
-                        if not raw_line:
-                            continue
-                        if not raw_line.startswith("data: "):
-                            continue
-                        ds = raw_line[6:].strip()
-                        if ds == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(ds)
-                            choices = obj.get("choices", [])
-                            if choices:
-                                delta   = choices[0].get("delta", {})
-                                content = delta.get("content")
-                                if content:
-                                    content = content.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
-                                    full_text += content
-                                    yield sse_chunk(content, model=self._proxy_id)
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            continue
-
-        except Exception as e:
-            log.error("Database stream error: %s", e)
-            yield sse_chunk(f"[Database Error: {e}]", model=self._proxy_id)
-            yield sse_chunk(model=self._proxy_id, finish=True)
-            yield "data: [DONE]\n\n"
-            return
-
-        log.info("Database: done real_model=%s text_len=%d", real_model, len(full_text))
-
-        if not full_text:
-            yield sse_chunk("[Database: empty response]", model=self._proxy_id)
-
-        yield sse_chunk(model=self._proxy_id, finish=True)
-        yield "data: [DONE]\n\n"
-
-
-for _proxy_id, _real_model in DATABASE_MODELS.items():
-    register_backend(DatabaseBackend(_proxy_id, _real_model))
 
 
 # ══════════════════════════════════════════════════════════
@@ -986,6 +793,7 @@ def resolve_extra(body: Dict, model: str) -> Dict:
     if model in (DEEPSEEK_PROXY_ID_EXPERT, DEEPSEEK_PROXY_ID_DEFAULT):
         mt = extra_body.get("model_type") or body.get("model_type")
         if not mt:
+            # نستخدم model_type المرتبط بالنموذج نفسه
             mt = "expert" if model == DEEPSEEK_PROXY_ID_EXPERT else "default"
         extra["model_type"] = mt if mt in ("default", "expert") else "expert"
         se = extra_body.get("search_enabled")
@@ -1029,7 +837,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="8.1.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="7.0.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -1040,57 +848,30 @@ def _extract_token(authorization: Optional[str]) -> str:
     return parts[1].strip() if len(parts) == 2 else parts[0].strip()
 
 
-def _is_database_model(model: str) -> bool:
-    return model in DATABASE_MODELS or model in _DB_REAL_TO_PROXY
-
-
 @app.get("/", tags=["health"])
 async def health():
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "8.1.0",
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "7.0.0",
         "active_sessions": len(_sessions), "backends": list(_BACKENDS.keys()),
         "models": {
             "qwen":             "Qwen3.8-max via chat.qwen.ai",
             "deepseek":         "DeepSeek Expert via chat.deepseek.com",
             "deepseek-default": "DeepSeek Default (fast) via chat.deepseek.com",
-            **{pid: f"{rm} via Supabase Database" for pid, rm in DATABASE_MODELS.items()},
         },
-        "database_token": DATABASE_FIXED_TOKEN,
         "notes": [
-            "v8.1: GPT backend removed",
-            "v8.1: Database messages sanitized before sending (fixes 400 errors)",
-            "v8: Database backend added — Gemini, GPT-5, Claude via Supabase",
-            "v7: conv_id is stable (anchored to first message)",
+            "v7: conv_id is now stable (anchored to first message) — no more new DS sessions per turn",
+            "v7: Two DeepSeek models: 'deepseek' (expert) and 'deepseek-default' (fast)",
         ],
     }
 
 
 @app.get("/v1/models", tags=["models"])
 async def list_models():
-    models = []
-
-    for mid in ["qwen", "deepseek", "deepseek-default"]:
-        if mid in _BACKENDS:
-            models.append({
-                "id": mid, "object": "model",
-                "created": 1700000000, "owned_by": "proxy",
-            })
-
-    models.append({
-        "id": "qwen-vision", "object": "model",
-        "created": 1700000000, "owned_by": "qwen",
-    })
-
-    for proxy_id, real_model in DATABASE_MODELS.items():
-        provider = real_model.split("/")[0]
-        models.append({
-            "id":         proxy_id,
-            "object":     "model",
-            "created":    1700000000,
-            "owned_by":   f"database-{provider}",
-            "real_model": real_model,
-        })
-
+    models = [
+        {"id": mid, "object": "model", "created": 1700000000, "owned_by": "proxy"}
+        for mid in _BACKENDS
+    ]
+    models.append({"id": "qwen-vision", "object": "model", "created": 1700000000, "owned_by": "qwen"})
     return {"object": "list", "data": models}
 
 
@@ -1099,36 +880,17 @@ async def chat_completions(
     request:       Request,
     authorization: Optional[str] = Header(None),
 ):
-    token     = _extract_token(authorization)
-    body      = await request.json()
-    messages  = body.get("messages", [])
-    tools     = body.get("tools", [])
+    token    = _extract_token(authorization)
+    body     = await request.json()
+    messages = body.get("messages", [])
+    tools    = body.get("tools", [])
     do_stream = body.get("stream", False)
-    model     = body.get("model", QWEN_PROXY_ID)
-
-    effective_token = token
-
-    if _is_database_model(model) and not _db_is_database_token(token):
-        raise HTTPException(
-            status_code=401,
-            detail=(
-                f"Database models require token '{DATABASE_FIXED_TOKEN}'. "
-                f"Received: '{token[:20]}...'"
-            ),
-        )
-
-    if _db_is_database_token(token) and not _is_database_model(model):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Token '{DATABASE_FIXED_TOKEN}' is only for Database models (db-*). "
-                f"Model '{model}' is not a Database model."
-            ),
-        )
+    model    = body.get("model", QWEN_PROXY_ID)
 
     thinking = resolve_thinking(body)
     extra    = resolve_extra(body, model)
 
+    # ★ conv_id ثابت — الإصلاح الرئيسي
     explicit_conv_id = (
         body.get("conversation_id")
         or body.get("session_id")
@@ -1147,25 +909,22 @@ async def chat_completions(
 
     backend = get_backend(model)
     if backend is None:
-        proxy_id = _DB_REAL_TO_PROXY.get(model)
-        if proxy_id:
-            backend = get_backend(proxy_id)
-    if backend is None:
         backend = get_backend(QWEN_PROXY_ID)
         if backend is None:
             raise HTTPException(status_code=400, detail=f"No backend for model '{model}'.")
 
     if do_stream:
         async def event_stream():
-            async for chunk in backend.complete(effective_token, messages, tools, thinking, conv_id, extra):
+            async for chunk in backend.complete(token, messages, tools, thinking, conv_id, extra):
                 yield chunk
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
+    # Non-streaming
     full_content   = ""
     finish_reason  = "stop"
     tool_call_data = None
 
-    async for chunk in backend.complete(effective_token, messages, tools, thinking, conv_id, extra):
+    async for chunk in backend.complete(token, messages, tools, thinking, conv_id, extra):
         if chunk.startswith("data: [DONE]"):
             break
         if not chunk.startswith("data: "):
@@ -1380,5 +1139,51 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v8.1 on port %d", port)
+    log.info("Starting Universal AI Proxy v7.0 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+
+# ══════════════════════════════════════════════════════════
+# ملخص استخدام الـ API  (v7.0)
+# ══════════════════════════════════════════════════════════
+#
+# ① Qwen:
+#    POST /v1/chat/completions
+#    Authorization: Bearer <qwen_token>
+#    {"model": "qwen", "messages": [...], "thinking": true/false}
+#
+# ② DeepSeek Expert (الأقوى):
+#    POST /v1/chat/completions
+#    Authorization: Bearer <deepseek_token>
+#    {
+#      "model": "deepseek",
+#      "messages": [...],
+#      "thinking": true/false,
+#      "extra_body": {
+#        "search_enabled": true       // أو false
+#      }
+#    }
+#
+# ③ DeepSeek Default (السريع):
+#    POST /v1/chat/completions
+#    Authorization: Bearer <deepseek_token>
+#    {
+#      "model": "deepseek-default",
+#      "messages": [...],
+#      "thinking": false,
+#      "extra_body": {
+#        "search_enabled": true       // أو false
+#      }
+#    }
+#    - في OpenMinis: أضف نموذجين بنفس التوكن، model يتغير فقط
+#    - thinking chunk منفصل: data: {"type":"thinking","content":"..."}
+#    - باقي الرد بصيغة OpenAI العادية
+#
+# ══════════════════════════════════════════════════════════
+# ملاحظات v7 الجديدة:
+#   • conv_id مرتكز على أول رسالة فقط (ثابت طوال المحادثة)
+#   • لا تُنشأ جلسة DeepSeek جديدة مع كل رسالة
+#   • نموذجان لـ DeepSeek في OpenMinis:
+#     - "deepseek"         → Expert  (أبطأ، أقوى)
+#     - "deepseek-default" → Default (أسرع، خفيف)
+# ══════════════════════════════════════════════════════════
