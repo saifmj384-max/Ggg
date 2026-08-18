@@ -1,5 +1,5 @@
 """
-Qwen → OpenAI-Compatible Proxy  v4.0
+Qwen → OpenAI-Compatible Proxy  v4.1
 ======================================
 إصلاح جذري: دعم كامل لـ Function Calling / Tool Use لأجل OpenMinis
 
@@ -101,7 +101,7 @@ def _evict_old_sessions() -> None:
 # ══════════════════════════════════════════════════════════
 app = FastAPI(
     title="Qwen OpenAI-Compatible Proxy",
-    version="4.0.0",
+    version="4.1.0",
     docs_url="/docs",
 )
 
@@ -201,25 +201,24 @@ TOOL USE INSTRUCTIONS
 ══════════════════════════════════════
 You have access to the tools listed in <available_tools> above.
 
-CRITICAL: When you need to call a tool, you MUST respond ONLY with this exact XML format and NOTHING else — no explanation before or after:
+CRITICAL RULE: When you need to call a tool, your ENTIRE response must be ONLY this one line — no text before it, no text after it:
 
-<tool_call>
-<name>TOOL_NAME_HERE</name>
-<arguments>
-{
-  "param1": "value1",
-  "param2": "value2"
-}
-</arguments>
-</tool_call>
+ACTION: tool_name|{"param1": "value1", "param2": "value2"}
 
-When you have enough information to give a FINAL answer (no more tool calls needed), respond normally in plain text WITHOUT any XML tags.
+Real examples:
+ACTION: shell_execute|{"command": "uname -a"}
+ACTION: browser_open|{"url": "https://example.com"}
+ACTION: read_file|{"path": "/home/user/file.txt"}
+ACTION: write_file|{"path": "/tmp/out.txt", "content": "hello"}
+
+When you have a FINAL answer and no more tools are needed, write your response as normal text with NO "ACTION:" prefix.
 
 Rules:
-- ONE tool call per response maximum
-- NEVER invent tool results — wait for the system to provide them
-- After receiving tool results, either call another tool OR give your final answer
-- Tool results will appear in the conversation as [TOOL RESULT: tool_name] ... [/TOOL RESULT]
+- Output ONLY the ACTION line when calling a tool — zero extra words
+- Use valid JSON for the arguments (double quotes, proper escaping)
+- ONE tool call per response
+- NEVER invent tool results — wait for the system to execute and return them
+- Tool results arrive as: [TOOL RESULT: tool_name] ... [/TOOL RESULT]
 ══════════════════════════════════════
 """
 
@@ -358,41 +357,79 @@ def _build_full_prompt(messages: List[Dict], tools: List[Dict]) -> str:
 
 # ══════════════════════════════════════════════════════════
 # ★★★ تحليل رد Qwen: هل هو tool_call أم إجابة نهائية؟ ★★★
+# محلل شامل يستوعب كل الصيغ التي يُخرجها Qwen
 # ══════════════════════════════════════════════════════════
-
-# نمط XML للأداة
-_TOOL_CALL_RE = re.compile(
-    r"<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>",
-    re.DOTALL | re.IGNORECASE,
-)
-
 
 def _parse_tool_call(text: str) -> Optional[Dict]:
     """
-    إذا كان النص يحتوي على tool_call XML، استخرجه.
-    يُعيد dict مع name وarguments، أو None إذا لم يكن tool call.
+    يحاول استخراج tool call من رد Qwen بأي صيغة.
+    يدعم:
+      1. ACTION: tool_name|{json}          ← الصيغة المطلوبة منه
+      2. <name>X</name><parameter=Y>Z</parameter>  ← ما يُخرجه Qwen أحياناً
+      3. <tool_call><name>X</name><arguments>{json}</arguments></tool_call>  ← صيغتنا الأصلية
+    يُعيد {"name": str, "arguments": str(json)} أو None.
     """
-    m = _TOOL_CALL_RE.search(text)
-    if not m:
-        return None
 
-    name = m.group(1).strip()
-    args_str = m.group(2).strip()
-
-    # تحقق أن الـ arguments صالح JSON
-    try:
-        args_obj = json.loads(args_str)
-    except json.JSONDecodeError:
-        # حاول إصلاحه
+    # ── 1. الصيغة الجديدة: ACTION: tool_name|{...} ──────────
+    # تبحث في كل سطر للمرونة
+    m = re.search(r'(?m)^ACTION:\s*(\w+)\|(\{.*?\})\s*$', text, re.DOTALL)
+    if m:
+        tool_name = m.group(1).strip()
+        args_raw  = m.group(2).strip()
         try:
-            args_obj = json.loads(args_str.replace("'", '"'))
-        except Exception:
-            args_obj = {}
+            args_obj = json.loads(args_raw)
+        except json.JSONDecodeError:
+            try:
+                args_obj = json.loads(args_raw.replace("'", '"'))
+            except Exception:
+                args_obj = {"raw": args_raw}
+        log.info("Parsed ACTION format: %s", tool_name)
+        return {"name": tool_name, "arguments": json.dumps(args_obj, ensure_ascii=False)}
 
-    return {
-        "name": name,
-        "arguments": json.dumps(args_obj, ensure_ascii=False),
-    }
+    # ── 2. صيغة Qwen الفعلية: <name>X</name> <parameter=Y> Z </parameter> ──
+    # هذا ما يخرجه Qwen من تلقاء نفسه بدون تعليمات واضحة
+    m_name = re.search(r'<name>(.*?)</name>', text, re.DOTALL | re.IGNORECASE)
+    m_params = re.findall(r'<parameter[=:](\w+)>\s*(.*?)\s*</parameter>', text, re.DOTALL | re.IGNORECASE)
+    if m_name and m_params:
+        tool_name = m_name.group(1).strip()
+        params    = {}
+        for pname, pval in m_params:
+            params[pname.strip()] = pval.strip()
+        # الـ parameter الأول غالباً هو الرئيسي (command, url, path...)
+        log.info("Parsed Qwen parameter= format: %s params=%s", tool_name, list(params.keys()))
+        return {"name": tool_name, "arguments": json.dumps(params, ensure_ascii=False)}
+
+    # ── 3. صيغتنا الأصلية: <tool_call><name>X</name><arguments>{json}</arguments></tool_call> ──
+    m = re.search(
+        r'<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>',
+        text, re.DOTALL | re.IGNORECASE
+    )
+    if m:
+        tool_name = m.group(1).strip()
+        args_raw  = m.group(2).strip()
+        try:
+            args_obj = json.loads(args_raw)
+        except json.JSONDecodeError:
+            try:
+                args_obj = json.loads(args_raw.replace("'", '"'))
+            except Exception:
+                args_obj = {"raw": args_raw}
+        log.info("Parsed original XML format: %s", tool_name)
+        return {"name": tool_name, "arguments": json.dumps(args_obj, ensure_ascii=False)}
+
+    # ── 4. آخر محاولة: أي شيء يبدو كـ tool call بمجرد وجود <name> ──
+    # (عندما يُغلق Qwen بـ </function> بدلاً من </tool_call>)
+    m_name2 = re.search(r'<name>(.*?)</name>', text, re.IGNORECASE)
+    if m_name2 and ('<parameter' in text.lower() or '<argument' in text.lower()):
+        tool_name = m_name2.group(1).strip()
+        # استخرج أي شيء يبدو كأمر
+        m_cmd = re.search(r'<parameter[^>]*>\s*(.*?)\s*(?:</parameter>|</function>)', text, re.DOTALL | re.IGNORECASE)
+        cmd_val = m_cmd.group(1).strip() if m_cmd else ""
+        if tool_name and cmd_val:
+            log.info("Parsed fallback format: %s", tool_name)
+            return {"name": tool_name, "arguments": json.dumps({"command": cmd_val}, ensure_ascii=False)}
+
+    return None
 
 
 # ══════════════════════════════════════════════════════════
@@ -650,7 +687,7 @@ async def health():
     return {
         "status":          "ok",
         "proxy":           "Qwen OpenAI-Compatible Proxy",
-        "version":         "4.0.0",
+        "version":         "4.1.0",
         "active_sessions": len(_sessions),
         "features":        ["tool_calls", "system_prompt", "full_history", "streaming"],
     }
@@ -757,8 +794,14 @@ async def chat_completions(
 
     else:
         # إجابة نصية عادية
-        # نزيل أي XML artifact عشوائي قد يكون تسرّب
-        clean_text = _TOOL_CALL_RE.sub("", qwen_text).strip()
+        # نزيل أي بقايا XML/ACTION قد تكون تسرّبت
+        clean_text = qwen_text
+        # إزالة صيغة ACTION: إذا لم تُحلَّل كأداة (خطأ في التنسيق مثلاً)
+        clean_text = re.sub(r'(?m)^ACTION:\s*\S+\|.*$', '', clean_text)
+        # إزالة بقايا XML
+        clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', clean_text, flags=re.DOTALL | re.IGNORECASE)
+        clean_text = re.sub(r'</?function>', '', clean_text, flags=re.IGNORECASE)
+        clean_text = clean_text.strip()
 
         if do_stream:
             async def text_stream():
@@ -999,5 +1042,5 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Qwen Proxy v4.0 on port %d", port)
+    log.info("Starting Qwen Proxy v4.1 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
