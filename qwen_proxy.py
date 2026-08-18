@@ -1,14 +1,18 @@
 """
-Universal AI Proxy  v5.0
+Universal AI Proxy  v6.0
 =========================
-بروكسي موحد: Qwen (الآن) + جاهز لإضافة أي نموذج مستقبلاً
+بروكسي موحد يدعم ثلاثة نماذج:
+  ① Qwen        — عبر chat.qwen.ai       (token: Qwen Bearer)
+  ② DeepSeek    — عبر chat.deepseek.com  (token: DeepSeek Bearer)
+  ③ ChatGPT     — عبر android.chat.openai.com (token: GPT Authorization header)
 
-إصلاحات v5 مقارنة بـ v4:
-  ① الرسائل لا تُحذف — كل tool call يظهر كـ chunk منفصل في الـ stream
-  ② التفكير يعمل فعلاً — نستقبل reasoning_effort من OpenMinis ونحوّله لـ Qwen
-  ③ لا تكرار للأدوات — نرسل tool call واحداً فقط ونحمي من الـ race condition
-  ④ ترتيب صحيح: tool call → انتظار النتيجة → الخطوة التالية (بدون parallels)
-  ⑤ معمارية backend مرنة: أضف نموذجاً جديداً بكتابة class واحدة فقط
+القواعد الأساسية:
+  • كل نموذج يعمل بتوكن مستقل — لا تداخل أبداً
+  • Qwen   → model = "qwen"
+  • DeepSeek → model = "deepseek"  (يقبل extra_body.model_type = "default"|"expert")
+  • GPT    → model = "gpt"         (بدون thinking)
+  • DeepSeek يعتمد على Railway POW server فقط
+  • Thinking مدعوم في Qwen و DeepSeek، غير مدعوم في GPT
 """
 
 from __future__ import annotations
@@ -89,7 +93,6 @@ async def _evict_old_sessions() -> None:
 
 # ══════════════════════════════════════════════════════════
 # ★ معمارية Backend المرنة
-#   لإضافة نموذج جديد: اصنع class ترث من BaseBackend
 # ══════════════════════════════════════════════════════════
 
 class BaseBackend(ABC):
@@ -98,7 +101,7 @@ class BaseBackend(ABC):
     @property
     @abstractmethod
     def model_id(self) -> str:
-        """المعرّف الذي يُرسله OpenMinis في حقل model."""
+        """المعرّف الذي يُرسله العميل في حقل model."""
 
     @abstractmethod
     async def complete(
@@ -108,24 +111,23 @@ class BaseBackend(ABC):
         tools: List[Dict],
         thinking: bool,
         conv_id: str,
+        extra: Dict,
     ) -> AsyncIterator[str]:
         """
         يُنتج SSE chunks بصيغة OpenAI.
-        كل chunk عبارة عن سطر "data: {...}\\n\\n"
-        آخر chunk: "data: [DONE]\\n\\n"
+        extra: بيانات إضافية خاصة بالنموذج (مثل model_type لـ DeepSeek)
         """
 
 
-# ─── سجل الـ Backends ─────────────────────────────────────
-_BACKENDS: Dict[str, BaseBackend] = {}
+_BACKENDS: Dict[str, "BaseBackend"] = {}
 
 
-def register_backend(backend: BaseBackend) -> None:
+def register_backend(backend: "BaseBackend") -> None:
     _BACKENDS[backend.model_id] = backend
     log.info("Registered backend: %s", backend.model_id)
 
 
-def get_backend(model_id: str) -> Optional[BaseBackend]:
+def get_backend(model_id: str) -> Optional["BaseBackend"]:
     return _BACKENDS.get(model_id)
 
 
@@ -214,7 +216,6 @@ def messages_to_prompt(messages: List[Dict], tools: List[Dict]) -> Tuple[str, st
 
         if role == "system":
             continue
-
         elif role == "user":
             if isinstance(content, list):
                 text_parts = []
@@ -226,7 +227,6 @@ def messages_to_prompt(messages: List[Dict], tools: List[Dict]) -> Tuple[str, st
                             text_parts.append("[IMAGE]")
                 content = " ".join(text_parts)
             conv_parts.append(f"User: {content}")
-
         elif role == "assistant":
             if isinstance(content, list):
                 content = " ".join(
@@ -243,7 +243,6 @@ def messages_to_prompt(messages: List[Dict], tools: List[Dict]) -> Tuple[str, st
                     conv_parts.append(f"ACTION: {tc_name}|{tc_args}")
             else:
                 conv_parts.append(f"Assistant: {content}")
-
         elif role in ("tool", "function"):
             tool_name = m.get("name") or m.get("tool_call_id", "tool")
             if isinstance(content, list):
@@ -268,19 +267,11 @@ def build_full_prompt(messages: List[Dict], tools: List[Dict]) -> str:
     return "\n\n".join(parts)
 
 
-# ─── تحليل رد النموذج: هل هو tool call؟ ──────────────────
-
 def parse_tool_call(text: str) -> Optional[Dict]:
-    """
-    يتعرف على tool calls بكل صيغها الممكنة.
-    يُعيد {"name": str, "arguments": str(json)} أو None.
-    """
-    # 1. ACTION: tool_name|{json}
     m = re.search(r"(?m)^ACTION:\s*(\w+)\|(\{.*\})\s*$", text, re.DOTALL)
     if m:
         return _make_tc(m.group(1), m.group(2))
 
-    # 2. <tool_call><name>…</name><arguments>…</arguments></tool_call>
     m = re.search(
         r"<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>",
         text, re.DOTALL | re.IGNORECASE,
@@ -288,7 +279,6 @@ def parse_tool_call(text: str) -> Optional[Dict]:
     if m:
         return _make_tc(m.group(1), m.group(2))
 
-    # 3. <name>…</name> مع <parameter=x> (صيغة Qwen الخاصة)
     m_name   = re.search(r"<name>(.*?)</name>", text, re.IGNORECASE)
     m_params = re.findall(r"<parameter[=:](\w+)>\s*(.*?)\s*</parameter>", text, re.DOTALL | re.IGNORECASE)
     if m_name and m_params:
@@ -311,14 +301,11 @@ def _make_tc(name: str, args_raw: str) -> Dict:
 
 
 def clean_text(text: str) -> str:
-    """إزالة بقايا XML/ACTION من النص النهائي."""
     text = re.sub(r"(?m)^ACTION:\s*\S+\|.*$", "", text)
     text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r"</?function[^>]*>", "", text, flags=re.IGNORECASE)
     return text.strip()
 
-
-# ── OpenAI-compatible response builders ───────────────────
 
 def make_tc_response(tc: Dict, model: str) -> Dict:
     call_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -370,13 +357,6 @@ def sse_chunk(
     tc:        Optional[Dict] = None,
     call_id:   Optional[str]  = None,
 ) -> str:
-    """
-    يبني SSE data line واحداً.
-    ① محتوى نصي عادي
-    ② بداية tool_call (tc مُعطى، finish=False)
-    ③ نهاية tool_call   (tc مُعطى، finish=True)
-    ④ نهاية stream       (finish=True بدون tc)
-    """
     cid = call_id or f"call_{uuid.uuid4().hex[:24]}"
 
     if tc and not finish:
@@ -394,13 +374,10 @@ def sse_chunk(
             }],
         }
         choice = {"index": 0, "delta": delta, "finish_reason": None}
-
     elif finish and tc:
         choice = {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
-
     elif finish:
         choice = {"index": 0, "delta": {}, "finish_reason": "stop"}
-
     else:
         choice = {"index": 0, "delta": {"content": content}, "finish_reason": None}
 
@@ -415,7 +392,7 @@ def sse_chunk(
 
 
 # ══════════════════════════════════════════════════════════
-# ★ Qwen Backend
+# ★ BACKEND 1: Qwen  (لا يُمس — كما كان في v5)
 # ══════════════════════════════════════════════════════════
 
 QWEN_BASE          = "https://chat.qwen.ai/api/v2"
@@ -572,7 +549,6 @@ async def _qwen_stream_collect(
     payload:  Dict,
     client:   httpx.AsyncClient,
 ) -> Tuple[str, Optional[str]]:
-    """جمع الرد الكامل من Qwen. يُعيد (full_text, response_id)."""
     url      = f"{QWEN_BASE}/chat/completions"
     full_txt = ""
     resp_id: Optional[str] = None
@@ -604,7 +580,6 @@ async def _qwen_stream_collect(
                     full_txt += "[ERROR: Rate limited]"
                     break
 
-                # استخرج response_id
                 rid = (
                     obj.get("response_id")
                     or (
@@ -633,7 +608,7 @@ async def _qwen_stream_collect(
 
 
 class QwenBackend(BaseBackend):
-    """Backend يتصل بـ Qwen عبر موقع chat.qwen.ai."""
+    """Backend يتصل بـ Qwen — لم يتغير من v5."""
 
     @property
     def model_id(self) -> str:
@@ -646,27 +621,19 @@ class QwenBackend(BaseBackend):
         tools:    List[Dict],
         thinking: bool,
         conv_id:  str,
+        extra:    Dict,
     ) -> AsyncIterator[str]:
-        """
-        ينتج SSE chunks بصيغة OpenAI.
-
-        FIX ①: كل tool call يُرسَل كـ chunk مستقل → لا تُحذف رسالة
-        FIX ②: thinking يُفعَّل من حقل thinking في الطلب
-        FIX ③: حماية من تكرار tool calls بمفتاح idempotency
-        """
-        # ── بناء البرومبت الكامل ───────────────────────────
         prompt = build_full_prompt(messages, tools)
         if not prompt.strip():
             return
 
         await _evict_old_sessions()
 
-        # ── استرجاع أو إنشاء جلسة Qwen ───────────────────
         sess = await _get_session(token, conv_id)
         if sess:
             qwen_chat_id = sess["qwen_chat_id"]
             parent_id    = sess.get("parent_id")
-            log.info("Reusing qwen_chat_id=%s", qwen_chat_id)
+            log.info("Qwen: reusing chat_id=%s", qwen_chat_id)
         else:
             async with httpx.AsyncClient() as tmp:
                 qwen_chat_id = await _qwen_create_chat(token, tmp)
@@ -681,89 +648,704 @@ class QwenBackend(BaseBackend):
             thinking=thinking,
         )
 
-        # ── جمع رد Qwen (نجمع كاملاً لأن التحليل يحتاج النص كله) ─
         async with httpx.AsyncClient() as client:
             qwen_text, last_rid = await _qwen_stream_collect(
                 token, qwen_chat_id, payload, client
             )
 
         await _update_session(token, conv_id, parent_id=last_rid)
-        log.info("Qwen response: %d chars | parent=%s", len(qwen_text), last_rid)
+        log.info("Qwen: %d chars | parent=%s", len(qwen_text), last_rid)
 
-        # ── تحليل الرد ────────────────────────────────────
         tc = parse_tool_call(qwen_text)
-
         if tc:
-            log.info("Tool call: %s", tc["name"])
+            log.info("Qwen tool call: %s", tc["name"])
             call_id = f"call_{uuid.uuid4().hex[:24]}"
-            # FIX ①: نُرسل tool call كـ chunk → يظهر في الـ UI ولا يُحذف
             yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
             yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
             yield "data: [DONE]\n\n"
         else:
             txt = clean_text(qwen_text)
-            # نُرسل النص على شكل chunks صغيرة
             chunk_size = 40
-            for i in range(0, len(txt), chunk_size):
+            for i in range(0, max(len(txt), 1), chunk_size):
                 yield sse_chunk(txt[i:i+chunk_size], model=self.model_id)
             yield sse_chunk(model=self.model_id, finish=True)
             yield "data: [DONE]\n\n"
 
 
-# سجّل Qwen كـ default backend
 register_backend(QwenBackend())
 
 
 # ══════════════════════════════════════════════════════════
-# ★ FIX ②: معالجة thinking من OpenMinis
+# ★ BACKEND 2: DeepSeek
 #
-# OpenMinis يُرسل reasoning_effort: "low"/"medium"/"high"/"none"
-# عند تفعيل زر التفكير في الإعدادات.
-# نحوّله إلى bool لـ Qwen (الذي يفهم thinking_enabled فقط).
+# يدعم:
+#   • وضعين:  model_type = "default" | "expert"
+#             يُمرَّر عبر extra_body.model_type أو body.model_type
+#             الافتراضي: "expert"
+#   • التفكير: thinking_enabled  (نفس آلية Qwen)
+#   • البحث:  search_enabled
+#   • POW:    من Railway فقط
+#   • Session: session_id + parent_message_id
+# ══════════════════════════════════════════════════════════
+
+DEEPSEEK_PROXY_ID   = "deepseek"
+DEEPSEEK_CHAT_URL   = "https://chat.deepseek.com/api/v0/chat/completion"
+DEEPSEEK_SESSION_URL = "https://chat.deepseek.com/api/v0/chat_session/create"
+RAILWAY_POW_URL     = "https://pow.up.railway.app/pow"
+
+
+def _ds_rangers_id() -> str:
+    ts = int(time.time() * 1000)
+    rv = int(1_000_000_000 + (uuid.uuid4().int % 8_999_999_999))
+    return str((ts << 32) | rv)
+
+
+def _ds_device_id() -> str:
+    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    import random
+    return "".join(random.choice(chars) for _ in range(88))
+
+
+def _ds_tz_offset() -> str:
+    return str(int(datetime.now(timezone.utc).utcoffset().total_seconds()
+                   if datetime.now(timezone.utc).utcoffset() else 0))
+
+
+def _ds_headers(token: str, pow_response: str) -> Dict[str, str]:
+    return {
+        "User-Agent":              "DeepSeek/2.1.1 Android/36",
+        "Accept":                  "application/json",
+        "Accept-Encoding":         "gzip",
+        "Content-Type":            "application/json",
+        "x-client-platform":       "android",
+        "x-client-version":        "2.1.1",
+        "x-client-locale":         "ar",
+        "x-client-bundle-id":      "com.deepseek.chat",
+        "x-rangers-id":            _ds_rangers_id(),
+        "x-client-timezone-offset": _ds_tz_offset(),
+        "x-device-id":             _ds_device_id(),
+        "x-os-version":            "30",
+        "x-app-version":           "2.1.1",
+        "Authorization":           f"Bearer {token}",
+        "X-DS-PoW-Response":       pow_response,
+        "accept-charset":          "UTF-8",
+    }
+
+
+def _ds_session_headers(token: str) -> Dict[str, str]:
+    return {
+        "x-client-bundle-id":       "com.deepseek.chat",
+        "x-client-platform":        "web",
+        "x-client-version":         "2.0.0",
+        "x-client-locale":          "en_US",
+        "x-client-timezone-offset": _ds_tz_offset(),
+        "x-app-version":            "2.0.0",
+        "Authorization":            f"Bearer {token}",
+        "Content-Type":             "application/json",
+        "Accept":                   "*/*",
+    }
+
+
+async def _ds_get_pow(token: str, client: httpx.AsyncClient) -> Tuple[str, Any]:
+    """يجلب POW من Railway ويُعيد (pow_response_header, pow_data_for_body)."""
+    url = f"{RAILWAY_POW_URL}?authorization={token}"
+    try:
+        resp = await client.get(url, timeout=30)
+        if resp.status_code != 200:
+            # fallback بدون توكن
+            resp = await client.get(RAILWAY_POW_URL, timeout=30)
+        data = resp.json()
+        pow_response = data.get("x_ds_pow_response") or data.get("pow_response", "")
+        pow_data     = data.get("solved_json", None)
+        if not pow_response:
+            raise ValueError(f"POW response empty: {data}")
+        log.info("DeepSeek: POW fetched OK")
+        return pow_response, pow_data
+    except Exception as e:
+        log.error("DeepSeek: POW fetch failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"POW server error: {e}")
+
+
+async def _ds_create_session(token: str, client: httpx.AsyncClient) -> str:
+    """ينشئ جلسة DeepSeek ويُعيد session_id."""
+    resp = await client.post(
+        DEEPSEEK_SESSION_URL,
+        json={},
+        headers=_ds_session_headers(token),
+        timeout=30,
+    )
+    data = resp.json()
+    sid = (
+        (data.get("data") or {}).get("biz_data", {}).get("chat_session", {}).get("id")
+        or data.get("session_id")
+    )
+    if not sid:
+        raise HTTPException(status_code=502, detail=f"DeepSeek: failed to create session: {data}")
+    log.info("DeepSeek: created session_id=%s", sid)
+    return sid
+
+
+class DeepSeekBackend(BaseBackend):
+    """
+    Backend يتصل بـ DeepSeek عبر محاكاة التطبيق الأندرويد.
+
+    extra keys مدعومة:
+      model_type   : "default" | "expert"  (default: "expert")
+      search_enabled: bool                  (default: True)
+    """
+
+    @property
+    def model_id(self) -> str:
+        return DEEPSEEK_PROXY_ID
+
+    async def complete(
+        self,
+        token:    str,
+        messages: List[Dict],
+        tools:    List[Dict],
+        thinking: bool,
+        conv_id:  str,
+        extra:    Dict,
+    ) -> AsyncIterator[str]:
+
+        # ── استخراج الخيارات ──────────────────────────────
+        model_type     = extra.get("model_type", "expert")
+        if model_type not in ("default", "expert"):
+            model_type = "expert"
+        search_enabled = extra.get("search_enabled", True)
+
+        # ── بناء البرومبت ─────────────────────────────────
+        prompt = build_full_prompt(messages, tools)
+        if not prompt.strip():
+            return
+
+        await _evict_old_sessions()
+
+        # ── استرجاع أو إنشاء جلسة DeepSeek ──────────────
+        sess = await _get_session(token, conv_id)
+        async with httpx.AsyncClient() as client:
+            if sess:
+                session_id        = sess["ds_session_id"]
+                parent_message_id = sess.get("ds_parent_msg_id")
+                log.info("DeepSeek: reusing session=%s", session_id)
+            else:
+                session_id        = await _ds_create_session(token, client)
+                parent_message_id = None
+                await _set_session(token, conv_id, {
+                    "ds_session_id":    session_id,
+                    "ds_parent_msg_id": parent_message_id,
+                })
+
+            # ── جلب POW ───────────────────────────────────
+            pow_response, pow_data = await _ds_get_pow(token, client)
+
+            payload = {
+                "chat_session_id":  session_id,
+                "parent_message_id": parent_message_id,
+                "prompt":           prompt,
+                "ref_file_ids":     [],
+                "thinking_enabled": thinking,
+                "search_enabled":   search_enabled,
+                "model_type":       model_type,
+                "action":           None,
+                "preempt":          False,
+                "pow":              pow_data,
+                "stream":           True,
+            }
+
+            headers = _ds_headers(token, pow_response)
+
+            # ── stream + جمع الرد ─────────────────────────
+            full_text          = ""
+            thinking_text      = ""
+            new_parent_msg_id  = None
+
+            try:
+                async with client.stream(
+                    "POST", DEEPSEEK_CHAT_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
+                ) as resp:
+                    # نقرأ أول سطر للحصول على message IDs
+                    first_done = False
+                    async for raw_line in resp.aiter_lines():
+                        if not raw_line:
+                            continue
+                        if not raw_line.startswith("data: "):
+                            continue
+                        ds = raw_line[6:].strip()
+                        if ds == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(ds)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # أول رسالة: نستخرج IDs
+                        if not first_done:
+                            req_id  = obj.get("request_message_id")
+                            resp_id = obj.get("response_message_id")
+                            if req_id and resp_id:
+                                new_parent_msg_id = resp_id
+                                first_done = True
+                                continue
+
+                        # محتوى
+                        v = obj.get("v")
+                        p = obj.get("p", "")
+                        o = obj.get("o", "")
+
+                        if isinstance(v, str) and o == "APPEND" and "content" in p:
+                            full_text += v
+                            continue
+
+                        if isinstance(v, dict):
+                            frags = (v.get("response") or {}).get("fragments", [])
+                            for frag in frags:
+                                ftype = frag.get("type", "")
+                                fcont = frag.get("content", "") or ""
+                                if ftype == "THINKING":
+                                    thinking_text += fcont
+                                elif ftype == "RESPONSE":
+                                    full_text += fcont
+
+                        if isinstance(v, str) and not p:
+                            full_text += v
+
+            except Exception as e:
+                log.error("DeepSeek stream error: %s", e)
+                yield sse_chunk(f"[DeepSeek Error: {e}]", model=self.model_id)
+                yield sse_chunk(model=self.model_id, finish=True)
+                yield "data: [DONE]\n\n"
+                return
+
+        # ── حفظ الجلسة ───────────────────────────────────
+        if new_parent_msg_id:
+            await _update_session(token, conv_id, ds_parent_msg_id=new_parent_msg_id)
+
+        log.info(
+            "DeepSeek: text=%d thinking=%d parent=%s mode=%s",
+            len(full_text), len(thinking_text), new_parent_msg_id, model_type,
+        )
+
+        # ── إرسال thinking كـ chunk خاص (اختياري للعملاء الذكية) ──
+        if thinking_text:
+            thinking_payload = json.dumps({
+                "type":    "thinking",
+                "content": thinking_text,
+            }, ensure_ascii=False)
+            yield f"data: {thinking_payload}\n\n"
+
+        # ── تحليل وإرسال الرد ─────────────────────────────
+        tc = parse_tool_call(full_text)
+        if tc:
+            log.info("DeepSeek tool call: %s", tc["name"])
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
+            yield "data: [DONE]\n\n"
+        else:
+            txt = clean_text(full_text) or "[DeepSeek: empty response]"
+            chunk_size = 40
+            for i in range(0, max(len(txt), 1), chunk_size):
+                yield sse_chunk(txt[i:i+chunk_size], model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+
+
+register_backend(DeepSeekBackend())
+
+
+# ══════════════════════════════════════════════════════════
+# ★ BACKEND 3: ChatGPT (GPT-5)
+#
+# يدعم:
+#   • محاكاة تطبيق أندرويد (نفس headers التطبيق)
+#   • conversation_id + parent_message_id للحفاظ على السياق
+#   • بدون thinking (GPT لا يدعمه بهذه الطريقة)
+#   • sentinel_payload ثابت (من الكود الأصلي)
+# ══════════════════════════════════════════════════════════
+
+GPT_PROXY_ID   = "gpt"
+GPT_BASE_URL   = "https://android.chat.openai.com/backend-api"
+GPT_DEVICE_ID  = "4cdd060c-f77d-4944-aedb-46ef8aa8bb38"
+GPT_STABLE_ID  = "5d2b760d-7e29-40da-bc66-06ca6e28806a"
+GPT_MODEL      = "gpt-5-5"
+GPT_ACCOUNT_ID = "6a6cac80-ff60-83ea-8e92-b6c8156af25f"
+
+# sentinel_payload ثابت (من الواجهة الأصلية)
+GPT_SENTINEL_PAYLOAD = (
+    '{"bot_token":{"play_integrity_token":"CrMCARCnMGuYmzFJH-LB0wNNTzP1k-kmDrSLKNTYvoZXzR2Zne_AYqlPnp2GDMV9WlF52PvI00Babh54uEkFHahWaY_jTq9KTZ19PPU83ZJ0NzUi-eZI-KuPetJfZFsOuBzQkoHtcjTvXED0YG-u9A0P2-d5UOTg-KNjb58j2-nx8eBUAZ86q8GuRzUQUUZzD0g7Y1iXggxnmSc17v5FDhvo-Dm6Ma0ArxP2rZi0bT4AX5CQawq-FzRB2qjIJV-apy0r3C78iX46J8mkST2IsNWToAKi7EG9-aLJeNjfYscjunDH-C9PLdppAGAfki9Fnnvos6FfFkYtkU_9-gSNZ1_FQYhBpAvsauaiVRICzdAGo17WcO78r0cfV56qbXghNHdpQm1Vx32gO4k-0_lQvg9ii9cSKxp-AVDILS3yconjokLr891GPEhBjbWS5vkHDV8HuH5__gDWn5E22xK9mtjuXi6Lij-vva88cpaJaYnGB_5bl8-AmDPiZzVwC2fxSMZhCl0EvZrf-jaUdwHtuhOsya-63uoweH6nj2GMVRxPIE_CM4Lj8MrUFj6oG5FAl2uc2UIl","chat_requirement_token":"gAAAAABqa4dkAuZ1kMHlVAHVqBkHwkRmnFMFVoR6Ce75hQ4QmYoQnqmrGOAeU1WUyEzgVzPEtSohzSSs3ILEXozZQR2BFsBDv9-YX9IegEPyp5hfQNRH39H3hpX4XU2sHkdGBTBehgKwj7vyNPvAuQ94IQNwjxm7sbC8aXLgoWYjK_p5xdik_CqmLkFjQWUhoozqxOnPEzDwybCwogxn4_CSWUKCOK0YerpTgXjWoEFrGIgj_EXOV_pE5pvJamOA2sK1GzOC6RVpMbtgyQUm_aQYh6GgtSDOJm2imURp6Ai0PG2QSIvj49sb0Vgod4NhYn27qyzFGSOFeEfgVFllAEGPysdqHQfdUks0RNM-7CAOxUK0E5WgDhhoeM1S8aOwtg_7JNHPziqhauUaIF3_ls7_laqFATtv9Ydzr2W6Ka-T6g8rmHwgo69VXqqr7Prgd8LYwvXN0GRXdXYBNW4dC9EDnMOWcNQkbO9SiOcGtBqSDblYNSBrIG_YUNBGGFhM3QTmTg1pIfP4lO7rlxwy6N1Em6RqzX95Md0czVluz97VHsec3rDVPoP6HV7EPlfUhyepwTuzElPrVJXXzSYjBK4OR5BoqFJoApDr3whGkkFCj1v9D3crUkv4wLDA1xEG6D9L7eBVUkgvNUbzDTAVm8i7kC85c_qOcpmRcQVR2VjgWsLkVwSXz_tpRrI4C1DMqdFppvxbMoEjB0VeH455UkI6V4gjDEOcu3R0P7gr71i1PWG56O85myOv0K9zGbcHaMwJ7f_X7rl79ygVGttp22FIeJ5ZNfI3-IUV7WN8J2rbIOfS9WFKY8nTSQgQ3ITYdGNYWjaNS6gsZwH-hizcHpQH574wcMJE9rLikX-mw-qmi56xzL3eEjxgwHUARyNTwqDY_dfuw9ZqmVZu2kvQ6_Jn7HW6JVkEw1y7km-SLLU7dad0AvsUavLO9FdbpeykMseZ3IrJu0LdjyRLPpOiYQQ77Vni9Woy5wZmDQ56WwCZYlLdDbpq0yPuyAusKtCA1hPj0oF6WjwrnKxmTymF62hVxKFPrslEtA=="}}'
+)
+
+
+def _gpt_base_headers(authorization: str, device_id: Optional[str] = None) -> Dict[str, str]:
+    """Headers تحاكي تطبيق ChatGPT الأندرويد."""
+    did = device_id or GPT_DEVICE_ID
+    return {
+        "User-Agent":                 "ChatGPT/1.2026.195 (Android 16; 24117RN76G; build 2619512)",
+        "Accept":                     "application/json",
+        "Accept-Encoding":            "gzip",
+        "Content-Type":               "application/json",
+        "oai-package-name":           "com.openai.chatgpt",
+        "oai-client-type":            "android",
+        "oai-device-id":              did,
+        "accept-language":            "ar,en-US;q=0.9",
+        "x-device-tier":              "mid",
+        "chatgpt-account-id":         GPT_ACCOUNT_ID,
+        "chatgpt-residency-region":   "no_constraint",
+        "x-storefront-country-code":  "US",
+        "authorization":              authorization,
+    }
+
+
+async def _gpt_prepare_conduit(authorization: str, client: httpx.AsyncClient) -> Optional[str]:
+    """يجلب conduit_token من GPT prepare endpoint."""
+    url = f"{GPT_BASE_URL}/f/conversation/prepare"
+    payload = {
+        "action":                        "next",
+        "messages":                      [],
+        "model":                         GPT_MODEL,
+        "history_and_training_disabled": False,
+        "fork_from_shared_post":         False,
+        "enable_message_followups":      True,
+        "force_use_sse":                 False,
+        "force_use_search":              None,
+        "force_paragen":                 False,
+        "supported_encodings":           ["v1"],
+        "supports_buffering":            True,
+        "timezone":                      "Africa/Cairo",
+        "timezone_offset_min":           -180,
+        "system_hints":                  [],
+        "is_onboarding_conversation":    False,
+        "client_prepare_dispatch":       "debounced",
+        "client_prepare_source":         "composer_editor_state",
+    }
+    try:
+        resp = await client.post(
+            url, json=payload,
+            headers=_gpt_base_headers(authorization),
+            timeout=30,
+        )
+        data = resp.json()
+        token = data.get("conduit_token")
+        if token:
+            log.info("GPT: conduit_token fetched")
+        return token
+    except Exception as e:
+        log.warning("GPT: prepare failed: %s", e)
+        return None
+
+
+class GPTBackend(BaseBackend):
+    """
+    Backend يتصل بـ ChatGPT (GPT-5) عبر محاكاة تطبيق أندرويد.
+
+    التوكن المطلوب: Authorization header الكامل (Bearer eyJ...)
+    بدون thinking (GPT لا يدعمه بهذه الطريقة)
+
+    extra keys مدعومة:
+      cookie: str   — Cookie header الكامل (اختياري، يُحسّن الاستقرار)
+    """
+
+    @property
+    def model_id(self) -> str:
+        return GPT_PROXY_ID
+
+    async def complete(
+        self,
+        token:    str,
+        messages: List[Dict],
+        tools:    List[Dict],
+        thinking: bool,   # يُتجاهل لـ GPT
+        conv_id:  str,
+        extra:    Dict,
+    ) -> AsyncIterator[str]:
+
+        # token هنا = Authorization header الكامل (Bearer ...)
+        # إذا لم يحتوِ على "Bearer" نضيفه
+        if not token.startswith("Bearer ") and not token.startswith("bearer "):
+            authorization = f"Bearer {token}"
+        else:
+            authorization = token
+
+        cookie = extra.get("cookie", "")
+
+        await _evict_old_sessions()
+
+        # ── بناء الرسالة الأخيرة ──────────────────────────
+        # GPT يتعامل مع المحادثة بشكل مختلف: نُرسل الرسالة الأخيرة فقط
+        # مع conversation_id للاستمرارية
+        last_user_msg = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                content = m.get("content", "")
+                if isinstance(content, list):
+                    content = " ".join(
+                        c.get("text", "") for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"
+                    )
+                last_user_msg = content
+                break
+
+        if not last_user_msg:
+            last_user_msg = build_full_prompt(messages, [])
+
+        # ── استرجاع أو إنشاء جلسة GPT ─────────────────────
+        sess = await _get_session(token[:32], conv_id)
+
+        async with httpx.AsyncClient() as client:
+            if sess:
+                conversation_id  = sess.get("gpt_conv_id")
+                parent_msg_id    = sess.get("gpt_parent_msg_id")
+                conduit_token    = sess.get("gpt_conduit_token")
+                log.info("GPT: reusing conv=%s", conversation_id)
+            else:
+                conversation_id = None
+                parent_msg_id   = None
+                conduit_token   = None
+
+            # ── جلب conduit token إذا لزم ─────────────────
+            if not conduit_token:
+                conduit_token = await _gpt_prepare_conduit(authorization, client)
+                if conduit_token:
+                    await _set_session(token[:32], conv_id, {
+                        "gpt_conv_id":       conversation_id,
+                        "gpt_parent_msg_id": parent_msg_id,
+                        "gpt_conduit_token": conduit_token,
+                    })
+
+            # ── بناء الـ payload ───────────────────────────
+            message_id = str(uuid.uuid4())
+            payload = {
+                "conversation_id":               conversation_id,
+                "action":                        "next",
+                "parent_message_id":             parent_msg_id,
+                "messages": [{
+                    "id":     message_id,
+                    "author": {"role": "user"},
+                    "content": {
+                        "parts":        [last_user_msg],
+                        "content_type": "text",
+                    },
+                    "status":    "finished_successfully",
+                    "recipient": "all",
+                    "metadata": {
+                        "model_slug":             GPT_MODEL,
+                        "default_model_slug":     GPT_MODEL,
+                        "is_visually_hidden_from_conversation": False,
+                        "exclude_after_next_user_message":      False,
+                        "content_references":  [],
+                        "search_result_groups": [],
+                        "search_queries":       [],
+                        "image_results":        [],
+                        "attachments":          [],
+                        "system_hints":         [],
+                        "dictation":            False,
+                        "voice_mode_message":   False,
+                        "image_gen_async":      False,
+                        "trigger_async_ux":     False,
+                        "writing_blocks":       {},
+                    },
+                }],
+                "attachment_mime_types":         [],
+                "model":                         GPT_MODEL,
+                "history_and_training_disabled": False,
+                "fork_from_shared_post":         False,
+                "enable_message_followups":      True,
+                "force_use_sse":                 True,
+                "force_use_search":              None,
+                "force_paragen":                 False,
+                "supported_encodings":           ["v1"],
+                "supports_buffering":            True,
+                "timezone":                      "Africa/Cairo",
+                "timezone_offset_min":           -180,
+                "system_hints":                  [],
+                "is_onboarding_conversation":    False,
+                "client_prepare_state":          "success",
+                "stream":                        True,
+            }
+
+            # إزالة None values
+            if not conversation_id:
+                payload.pop("conversation_id", None)
+            if not parent_msg_id:
+                payload.pop("parent_message_id", None)
+
+            # ── Headers ───────────────────────────────────
+            req_device_id = str(uuid.uuid4())
+            headers = {
+                **_gpt_base_headers(authorization, req_device_id),
+                "Accept":                    "text/event-stream,application/json",
+                "cache-control":             "no-cache",
+                "x-sentinel-payload":        GPT_SENTINEL_PAYLOAD,
+                "x-oai-convo-session-id":    str(uuid.uuid4()),
+                "x-oai-turn-trace-id":       str(uuid.uuid4()),
+                "x-openai-target-path":      "/backend-api/f/conversation",
+            }
+            if conduit_token:
+                headers["x-conduit-token"] = conduit_token
+            if cookie:
+                headers["Cookie"] = cookie
+
+            # ── stream ────────────────────────────────────
+            url       = f"{GPT_BASE_URL}/f/conversation"
+            full_text = ""
+            new_conv_id     = conversation_id
+            new_parent_id   = parent_msg_id
+
+            try:
+                async with client.stream(
+                    "POST", url,
+                    json=payload,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
+                ) as resp:
+                    async for raw_line in resp.aiter_lines():
+                        if not raw_line:
+                            continue
+                        if not raw_line.startswith("data: "):
+                            continue
+                        ds = raw_line[6:].strip()
+                        if ds == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(ds)
+                        except json.JSONDecodeError:
+                            continue
+
+                        # conversation_id
+                        if obj.get("conversation_id") and not new_conv_id:
+                            new_conv_id = obj["conversation_id"]
+
+                        # نص — صيغة append
+                        o_op = obj.get("o", "")
+                        p_op = obj.get("p", "")
+                        v_op = obj.get("v")
+
+                        if (o_op == "append"
+                                and "/message/content/parts/0" in p_op
+                                and isinstance(v_op, str)):
+                            full_text += v_op
+                            continue
+
+                        # نص — صيغة patch
+                        if o_op == "patch" and isinstance(v_op, list):
+                            for patch in v_op:
+                                if (patch.get("o") == "append"
+                                        and "/message/content/parts/0" in patch.get("p", "")
+                                        and isinstance(patch.get("v"), str)):
+                                    full_text += patch["v"]
+
+                        # message id (parent)
+                        msg = obj.get("message") or {}
+                        if msg.get("id"):
+                            new_parent_id = msg["id"]
+
+            except Exception as e:
+                log.error("GPT stream error: %s", e)
+                yield sse_chunk(f"[GPT Error: {e}]", model=self.model_id)
+                yield sse_chunk(model=self.model_id, finish=True)
+                yield "data: [DONE]\n\n"
+                return
+
+        # ── حفظ الجلسة ───────────────────────────────────
+        await _set_session(token[:32], conv_id, {
+            "gpt_conv_id":       new_conv_id,
+            "gpt_parent_msg_id": new_parent_id or message_id,
+            "gpt_conduit_token": conduit_token,
+        })
+
+        log.info(
+            "GPT: text=%d conv=%s parent=%s",
+            len(full_text), new_conv_id, new_parent_id,
+        )
+
+        # ── إرسال الرد ────────────────────────────────────
+        tc = parse_tool_call(full_text)
+        if tc:
+            log.info("GPT tool call: %s", tc["name"])
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
+            yield "data: [DONE]\n\n"
+        else:
+            txt = clean_text(full_text) or "[GPT: empty response]"
+            chunk_size = 40
+            for i in range(0, max(len(txt), 1), chunk_size):
+                yield sse_chunk(txt[i:i+chunk_size], model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+
+
+register_backend(GPTBackend())
+
+
+# ══════════════════════════════════════════════════════════
+# معالجة thinking و model_type من الطلب
 # ══════════════════════════════════════════════════════════
 
 def resolve_thinking(body: Dict) -> bool:
-    """
-    يستخرج قيمة التفكير من أي صيغة ترسلها OpenMinis:
-      - reasoning_effort: "none" → False
-      - reasoning_effort: أي قيمة أخرى → True
-      - thinking: true/false (صيغة قديمة)
-    """
+    """يستخرج قيمة التفكير من أي صيغة."""
     effort = body.get("reasoning_effort")
     if effort is not None:
         return str(effort).lower() not in ("none", "off", "false", "0", "")
 
-    # Anthropic-style: thinking: {"type": "enabled"/"disabled"}
     think_obj = body.get("thinking")
     if isinstance(think_obj, dict):
-        t = think_obj.get("type", "")
-        return t not in ("disabled", "none", "")
+        return think_obj.get("type", "") not in ("disabled", "none", "")
     if isinstance(think_obj, bool):
         return think_obj
 
     return False
 
 
+def resolve_extra(body: Dict, model: str) -> Dict:
+    """
+    يجمع الخيارات الإضافية الخاصة بكل نموذج.
+    يدعم extra_body أو top-level keys.
+    """
+    extra_body = body.get("extra_body") or {}
+    extra: Dict = {}
+
+    if model == DEEPSEEK_PROXY_ID:
+        # model_type: default | expert
+        mt = (
+            extra_body.get("model_type")
+            or body.get("model_type")
+            or "expert"
+        )
+        extra["model_type"] = mt if mt in ("default", "expert") else "expert"
+
+        # search_enabled
+        se = extra_body.get("search_enabled")
+        if se is None:
+            se = body.get("search_enabled")
+        extra["search_enabled"] = bool(se) if se is not None else True
+
+    elif model == GPT_PROXY_ID:
+        # cookie اختياري
+        extra["cookie"] = extra_body.get("cookie") or body.get("cookie") or ""
+
+    return extra
+
+
 # ══════════════════════════════════════════════════════════
-# ★ FIX ③: حماية من تكرار tool calls
-#
-# OpenMinis أحياناً يُرسل نفس الطلب مرتين بسرعة.
-# نستخدم deduplication بناءً على hash للطلب.
+# Deduplication
 # ══════════════════════════════════════════════════════════
 
 _recent_requests: Dict[str, float] = {}
 _req_lock = asyncio.Lock()
-DEDUP_WINDOW = 3.0  # ثوانٍ
+DEDUP_WINDOW = 3.0
 
 
 async def _is_duplicate(req_hash: str) -> bool:
     async with _req_lock:
-        now = time.time()
-        # نظّف القديم
+        now   = time.time()
         stale = [k for k, t in _recent_requests.items() if now - t > DEDUP_WINDOW * 10]
         for k in stale:
             del _recent_requests[k]
-        # تحقق
         if req_hash in _recent_requests:
             if now - _recent_requests[req_hash] < DEDUP_WINDOW:
                 return True
@@ -785,7 +1367,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 
 app = FastAPI(
     title="Universal AI Proxy",
-    version="5.0.0",
+    version="6.0.0",
     docs_url="/docs",
 )
 
@@ -810,15 +1392,20 @@ async def health():
     return {
         "status":          "ok",
         "proxy":           "Universal AI Proxy",
-        "version":         "5.0.0",
+        "version":         "6.0.0",
         "active_sessions": len(_sessions),
         "backends":        list(_BACKENDS.keys()),
-        "fixes":           [
-            "messages-not-deleted",
-            "thinking-toggle",
-            "no-duplicate-tool-calls",
-            "sequential-tool-execution",
-            "multi-backend-architecture",
+        "models": {
+            "qwen":     "Qwen3.8-max via chat.qwen.ai",
+            "deepseek": "DeepSeek via chat.deepseek.com (POW: Railway)",
+            "gpt":      "ChatGPT GPT-5 via android.chat.openai.com",
+        },
+        "notes": [
+            "Each model uses its own token — tokens are not interchangeable",
+            "DeepSeek: extra_body.model_type = 'default' | 'expert' (default: expert)",
+            "DeepSeek: extra_body.search_enabled = true | false (default: true)",
+            "GPT: thinking is not supported and will be ignored",
+            "GPT token = full Authorization header value (Bearer eyJ...)",
         ],
     }
 
@@ -829,17 +1416,16 @@ async def list_models():
     models = []
     for mid in _BACKENDS:
         models.append({
-            "id":         mid,
-            "object":     "model",
-            "created":    1700000000,
-            "owned_by":   "proxy",
+            "id":       mid,
+            "object":   "model",
+            "created":  1700000000,
+            "owned_by": "proxy",
         })
-    # إضافة الصورة (image generation) لـ qwen
     models.append({
-        "id":         "qwen-vision",
-        "object":     "model",
-        "created":    1700000000,
-        "owned_by":   "qwen",
+        "id":       "qwen-vision",
+        "object":   "model",
+        "created":  1700000000,
+        "owned_by": "qwen",
     })
     return {"object": "list", "data": models}
 
@@ -858,9 +1444,24 @@ async def chat_completions(
     do_stream = body.get("stream", False)
     model     = body.get("model", QWEN_PROXY_ID)
 
-    # FIX ②: استخراج thinking بشكل صحيح
+    # GPT: token = قيمة Authorization الكاملة للمستخدم
+    # إذا أرسل المستخدم "Bearer eyJ..." كـ Authorization header، نمرره كاملاً لـ GPT
+    if model == GPT_PROXY_ID:
+        # نُعيد بناء Authorization الكامل من الـ header
+        raw_auth = authorization or ""
+        gpt_token = raw_auth  # نمرر الـ header كاملاً
+    else:
+        gpt_token = token
+
+    effective_token = gpt_token if model == GPT_PROXY_ID else token
+
     thinking = resolve_thinking(body)
-    log.info("thinking=%s (reasoning_effort=%r)", thinking, body.get("reasoning_effort"))
+    extra    = resolve_extra(body, model)
+
+    log.info(
+        "thinking=%s model=%s (extra=%s)",
+        thinking, model, extra,
+    )
 
     # ── معرّف المحادثة ──────────────────────────────────
     conv_id = (
@@ -875,11 +1476,10 @@ async def chat_completions(
             json.dumps(key_msgs, ensure_ascii=False).encode()
         ).hexdigest()
 
-    # FIX ③: deduplication
+    # ── Deduplication ─────────────────────────────────
     req_hash = _request_hash(messages, tools)
     if await _is_duplicate(req_hash):
-        log.warning("Duplicate request detected (conv=%s) — skipping", conv_id)
-        # أرجع 429 لـ OpenMinis ليعيد المحاولة بعد لحظة
+        log.warning("Duplicate request (conv=%s) — skipping", conv_id)
         raise HTTPException(
             status_code=429,
             detail="Duplicate request — please retry in a moment.",
@@ -891,38 +1491,48 @@ async def chat_completions(
     )
 
     # ── اختر الـ backend ───────────────────────────────
-    backend = get_backend(model) or get_backend(QWEN_PROXY_ID)
+    backend = get_backend(model)
     if backend is None:
-        raise HTTPException(status_code=400, detail=f"No backend for model '{model}'.")
+        # fallback للـ Qwen إذا لم يُعرف النموذج
+        backend = get_backend(QWEN_PROXY_ID)
+        if backend is None:
+            raise HTTPException(status_code=400, detail=f"No backend for model '{model}'.")
 
     # ── Streaming ─────────────────────────────────────
     if do_stream:
         async def event_stream():
-            async for chunk in backend.complete(token, messages, tools, thinking, conv_id):
+            async for chunk in backend.complete(
+                effective_token, messages, tools, thinking, conv_id, extra
+            ):
                 yield chunk
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    # ── Non-streaming: جمع الـ chunks وتحويلها لـ JSON ─
-    full_content = ""
-    finish_reason = "stop"
+    # ── Non-streaming ──────────────────────────────────
+    full_content   = ""
+    finish_reason  = "stop"
     tool_call_data = None
     call_id_data   = None
 
-    async for chunk in backend.complete(token, messages, tools, thinking, conv_id):
+    async for chunk in backend.complete(
+        effective_token, messages, tools, thinking, conv_id, extra
+    ):
         if chunk.startswith("data: [DONE]"):
             break
         if not chunk.startswith("data: "):
             continue
         try:
             obj    = json.loads(chunk[6:])
+            # تجاهل chunks التفكير الخاصة بـ DeepSeek
+            if obj.get("type") == "thinking":
+                continue
             choice = obj["choices"][0]
             delta  = choice.get("delta", {})
             fr     = choice.get("finish_reason")
             if fr:
                 finish_reason = fr
             if delta.get("tool_calls"):
-                tc_item      = delta["tool_calls"][0]
+                tc_item        = delta["tool_calls"][0]
                 tool_call_data = tc_item
                 call_id_data   = tc_item.get("id")
             elif delta.get("content"):
@@ -942,7 +1552,7 @@ async def chat_completions(
 
 
 # ══════════════════════════════════════════════════════════
-# Image Generation  (Qwen t2i)
+# Image Generation  (Qwen t2i — لم يتغير)
 # ══════════════════════════════════════════════════════════
 
 @app.post("/v1/images/generations", tags=["images"])
@@ -993,7 +1603,7 @@ async def image_generations(
 
 
 # ══════════════════════════════════════════════════════════
-# Image Edits  (Qwen t2i + OSS upload)
+# Image Edits  (Qwen t2i + OSS — لم يتغير)
 # ══════════════════════════════════════════════════════════
 
 OSS_UPLOAD_TIMEOUT = 120
@@ -1035,12 +1645,12 @@ async def _upload_image(token: str, image_bytes: bytes, client: httpx.AsyncClien
         gmt = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
         sig = _oss_sig(aks, method, md5, ct, gmt, c_hdr, res_path)
         h   = {
-            "Authorization":     f"OSS {aki}:{sig}",
-            "User-Agent":        oss_ua,
-            "Host":              host,
+            "Authorization":        f"OSS {aki}:{sig}",
+            "User-Agent":           oss_ua,
+            "Host":                 host,
             "x-oss-security-token": stkn,
-            "Date":              gmt,
-            "Content-Type":      ct,
+            "Date":                 gmt,
+            "Content-Type":         ct,
         }
         if extra:
             h.update(extra)
@@ -1190,679 +1800,45 @@ async def _generic_err(request: Request, exc: Exception):
 
 
 # ══════════════════════════════════════════════════════════
-# ★ Kimi Backend  (kimi.com — gRPC/Connect protocol)
-# ══════════════════════════════════════════════════════════
-#
-# البروتوكول: Connect/gRPC-Web بدلاً من REST عادي.
-# كل رسالة = 5-byte header (flag + uint32 length) + JSON body.
-# التوكن = refresh_token يُجدَّد تلقائياً إلى access_token.
-# نموذج افتراضي: SCENARIO_K2D5  (kimi-k2.6)
-#
-# الفرق عن Qwen:
-#   - لا يوجد "chat session" مستمر؛ كل طلب يبني محادثة كاملة
-#   - الرد يصل كـ binary stream (framed messages) لا SSE
-#   - الأدوات الداخلية (search, image...) مُضمَّنة، لكننا نعطّلها
-#     ونستخدم الأدوات الخارجية عبر نفس آلية ACTION: التي يفهمها Qwen
-# ══════════════════════════════════════════════════════════
-
-import struct as _struct
-
-KIMI_BASE      = "https://www.kimi.com"
-KIMI_PROXY_ID  = "kimi"
-
-# النماذج المتاحة (يمكن تحديدها عبر model في الطلب):
-KIMI_MODELS = {
-    "kimi":           "SCENARIO_K2D5",   # kimi-k2.6 (افتراضي)
-    "kimi-k2":        "SCENARIO_K2D5",
-    "kimi-k3":        "SCENARIO_K3",
-    "kimi-auto":      "SCENARIO_UNSPECIFIED",
-    "kimi-solve":     "SCENARIO_PROBLEM_SOLVE",
-}
-
-_KIMI_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/132.0.0.0 Safari/537.36"
-)
-
-
-def _kimi_base_headers(device_id: str) -> Dict:
-    """Headers مشتركة لكل طلبات Kimi."""
-    return {
-        "User-Agent":          _KIMI_UA,
-        "Accept":              "*/*",
-        "Accept-Language":     "en-US,en;q=0.9",
-        "x-msh-device-id":    device_id,
-        "x-msh-platform":     "web",
-        "x-msh-session-id":   "1731757202045822784",
-        "x-msh-version":      "2.0.0",
-        "x-traffic-id":       "d8i4n6nahd86l5du0130",
-        "Origin":              KIMI_BASE,
-        "Referer":             f"{KIMI_BASE}/",
-        "Sec-Ch-Ua":           '"Not A(Brand";v="8", "Chromium";v="132"',
-        "Sec-Ch-Ua-Mobile":    "?0",
-        "Sec-Ch-Ua-Platform":  '"Windows"',
-        "Sec-Fetch-Dest":      "empty",
-        "Sec-Fetch-Mode":      "cors",
-        "Sec-Fetch-Site":      "same-origin",
-        "Cache-Control":       "no-cache",
-        "Pragma":              "no-cache",
-        "R-Timezone":          "Asia/Riyadh",
-        "X-Language":          "en-US",
-    }
-
-
-def _kimi_extract_device_id(refresh_token: str) -> str:
-    """يستخرج device_id من payload الـ JWT."""
-    try:
-        parts = refresh_token.split(".")
-        if len(parts) != 3:
-            raise ValueError("Invalid JWT")
-        payload = parts[1]
-        # إضافة padding
-        payload += "=" * (4 - len(payload) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
-        device_id = data.get("device_id")
-        if not device_id:
-            raise ValueError("No device_id in JWT")
-        return str(device_id)
-    except Exception as e:
-        log.error("Kimi: failed to extract device_id: %s", e)
-        return "7669233658326224138"  # fallback
-
-
-async def _kimi_refresh_token(refresh_token: str, device_id: str) -> str:
-    """يحوّل refresh_token → access_token."""
-    headers = {
-        **_kimi_base_headers(device_id),
-        "Authorization": f"Bearer {refresh_token}",
-    }
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(
-            f"{KIMI_BASE}/api/auth/token/refresh",
-            headers=headers,
-        )
-        if resp.status_code != 200:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Kimi token refresh failed: {resp.status_code}",
-            )
-        data = resp.json()
-        access_token = data.get("access_token")
-        if not access_token:
-            raise HTTPException(status_code=502, detail="Kimi: no access_token returned")
-        log.info("Kimi: token refreshed OK")
-        return access_token
-
-
-def _kimi_encode_message(payload: Dict) -> bytes:
-    """
-    يُشفّر payload كـ gRPC/Connect frame:
-    [flag:1byte][length:4bytes_big_endian][json_body]
-    """
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    header = _struct.pack(">BI", 0, len(body))
-    return header + body
-
-
-def _kimi_decode_frames(data: bytes) -> List[Dict]:
-    """
-    يُفكّك binary stream من Kimi إلى قائمة JSON objects.
-    كل frame = 5-byte header + JSON body.
-    """
-    results = []
-    offset  = 0
-    while offset + 5 <= len(data):
-        # flag byte (نتجاهله) + uint32 big-endian length
-        length = _struct.unpack(">I", data[offset + 1: offset + 5])[0]
-        end    = offset + 5 + length
-        if end > len(data):
-            break
-        raw = data[offset + 5: end]
-        offset = end
-        try:
-            results.append(json.loads(raw.decode("utf-8")))
-        except Exception:
-            continue
-    return results
-
-
-def _kimi_get_scenario(model_id: str) -> str:
-    """يُعيد SCENARIO المناسب حسب model_id."""
-    return KIMI_MODELS.get(model_id, KIMI_MODELS["kimi"])
-
-
-def _kimi_build_chat_payload(
-    messages:   List[Dict],
-    tools:      List[Dict],
-    thinking:   bool,
-    scenario:   str,
-    system_txt: str,
-) -> Dict:
-    """
-    يبني payload الـ Chat request لـ Kimi.
-
-    بنية الرسائل في Kimi:
-    - كل رسالة user أو assistant تُرسَل كـ block داخل message.blocks
-    - tool results تُرسَل كـ file blocks (Kimi لا يفهم OpenAI tool format)
-    - نعوّض ذلك بتضمين كل شيء في نص واحد (نفس أسلوب Qwen)
-    """
-
-    # ── بناء blocks قائمة الرسائل ───────────────────────
-    kimi_blocks: List[Dict] = []
-
-    # system prompt (يُضاف كأول block)
-    if system_txt:
-        kimi_blocks.append({
-            "role":    "user",
-            "message_id": "",
-            "blocks": [{"role": "user", "content": {"type": "text",
-                         "value": {"content": f"SYSTEM INSTRUCTIONS:\n\n{system_txt}"}}}],
-            "scenario": scenario,
-        })
-
-    # تحويل الرسائل
-    for m in messages:
-        role    = m.get("role", "user")
-        content = m.get("content") or ""
-
-        if role == "system":
-            continue
-
-        elif role == "user":
-            if isinstance(content, list):
-                text_parts = []
-                for c in content:
-                    if isinstance(c, dict):
-                        if c.get("type") == "text":
-                            text_parts.append(c.get("text", ""))
-                        elif c.get("type") == "image_url":
-                            text_parts.append("[IMAGE]")
-                content = " ".join(text_parts)
-            kimi_blocks.append({
-                "role":       "user",
-                "message_id": "",
-                "blocks": [{
-                    "role":    "user",
-                    "content": {"type": "text", "value": {"content": str(content)}},
-                }],
-                "scenario": scenario,
-            })
-
-        elif role == "assistant":
-            if isinstance(content, list):
-                content = " ".join(
-                    c.get("text", "")
-                    for c in content
-                    if isinstance(c, dict) and c.get("type") == "text"
-                )
-            tool_calls = m.get("tool_calls", [])
-            if tool_calls:
-                # assistant أعلن عن tool call سابقاً
-                tc_texts = []
-                for tc in tool_calls:
-                    func = tc.get("function", {})
-                    tc_texts.append(f"ACTION: {func.get('name')}|{func.get('arguments', '{}')}")
-                kimi_blocks.append({
-                    "role":       "assistant",
-                    "message_id": "",
-                    "blocks": [{
-                        "role":    "assistant",
-                        "content": {"type": "text", "value": {"content": "\n".join(tc_texts)}},
-                    }],
-                    "scenario": scenario,
-                })
-            elif content:
-                kimi_blocks.append({
-                    "role":       "assistant",
-                    "message_id": "",
-                    "blocks": [{
-                        "role":    "assistant",
-                        "content": {"type": "text", "value": {"content": str(content)}},
-                    }],
-                    "scenario": scenario,
-                })
-
-        elif role in ("tool", "function"):
-            tool_name = m.get("name") or m.get("tool_call_id", "tool")
-            if isinstance(content, list):
-                content = str(content)
-            result_text = (
-                f"[TOOL RESULT: {tool_name}]\n{content}\n[/TOOL RESULT]"
-            )
-            kimi_blocks.append({
-                "role":       "user",
-                "message_id": "",
-                "blocks": [{
-                    "role":    "user",
-                    "content": {"type": "text", "value": {"content": result_text}},
-                }],
-                "scenario": scenario,
-            })
-
-    if not kimi_blocks:
-        return {}
-
-    # آخر block هو رسالة المستخدم الحالية
-    last_block = kimi_blocks[-1]
-
-    return {
-        "scenario": scenario,
-        "tools":    [],           # نُعطّل أدوات Kimi الداخلية
-        "message": {
-            "role":     "user",
-            "blocks":   last_block.get("blocks", []),
-            "scenario": scenario,
-            "is_goal":  False,
-        },
-        "options": {
-            "thinking":     thinking,
-            "enablePlugin": False,
-        },
-        "project_id": "",
-        # تاريخ المحادثة (ما قبل آخر رسالة)
-        "history": kimi_blocks[:-1] if len(kimi_blocks) > 1 else [],
-    }
-
-
-def _kimi_extract_text_from_frames(frames: List[Dict]) -> str:
-    """
-    يجمع النص الكامل من frames Kimi.
-    يدعم: block.text.content  +  block.think.content (للتفكير)
-    """
-    text_parts = []
-
-    for frame in frames:
-        if "heartbeat" in frame or "notification" in frame:
-            continue
-        if "done" in frame:
-            break
-
-        block = frame.get("block", {})
-        if not block:
-            # قد يكون في message.blocks
-            msg = frame.get("message", {})
-            for blk in msg.get("blocks", []):
-                _kimi_extract_block_text(blk, text_parts)
-            continue
-
-        _kimi_extract_block_text(block, text_parts)
-
-    return "".join(text_parts)
-
-
-def _kimi_extract_block_text(block: Dict, out: List[str]) -> None:
-    """يستخرج النص من block واحد."""
-    # text block
-    txt_val = block.get("text", {})
-    if isinstance(txt_val, dict):
-        c = txt_val.get("content", "")
-        if c:
-            out.append(c)
-            return
-
-    # think block (تفكير — نتجاهله في الرد النهائي)
-    # يمكن إضافته لاحقاً كـ <think>...</think> إذا أردت
-
-    # content-based block
-    content = block.get("content", {})
-    if isinstance(content, dict):
-        if content.get("type") == "text":
-            val = content.get("value", {})
-            c   = val.get("content", "") if isinstance(val, dict) else str(val)
-            if c:
-                out.append(c)
-                return
-
-    # tool block — نتجاهله (نحن نعالج الأدوات عبر ACTION:)
-    # error block
-    err = block.get("error", {})
-    if err:
-        msg = err.get("error", {}).get("message", str(err))
-        out.append(f"[ERROR: {msg}]")
-
-
-class KimiBackend(BaseBackend):
-    """
-    Backend يتصل بـ Kimi (kimi.com) عبر Connect/gRPC protocol.
-
-    التوكن المطلوب: refresh_token من localStorage.getItem('refresh_token')
-    يُجدَّد تلقائياً إلى access_token في كل طلب.
-
-    النماذج المدعومة:
-      kimi / kimi-k2  → SCENARIO_K2D5  (kimi-k2.6)
-      kimi-k3         → SCENARIO_K3
-      kimi-auto       → SCENARIO_UNSPECIFIED
-      kimi-solve      → SCENARIO_PROBLEM_SOLVE
-    """
-
-    @property
-    def model_id(self) -> str:
-        return KIMI_PROXY_ID
-
-    async def complete(
-        self,
-        token:    str,
-        messages: List[Dict],
-        tools:    List[Dict],
-        thinking: bool,
-        conv_id:  str,
-    ) -> AsyncIterator[str]:
-
-        # ── 1. استخراج device_id وتجديد التوكن ──────────
-        device_id    = _kimi_extract_device_id(token)
-        access_token = await _kimi_refresh_token(token, device_id)
-
-        # ── 2. تحديد السيناريو (النموذج) ─────────────────
-        # نبحث عن model في أول رسالة نظام أو نستخدم الافتراضي
-        scenario = _kimi_get_scenario(conv_id.split(":")[0] if ":" in conv_id else KIMI_PROXY_ID)
-
-        # ── 3. بناء system prompt + tools ────────────────
-        system_parts = []
-        for m in messages:
-            if m.get("role") == "system":
-                c = m.get("content") or ""
-                if isinstance(c, list):
-                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
-                system_parts.append(str(c))
-
-        if tools:
-            system_parts.append(f"\n{tools_to_xml(tools)}\n{TOOL_SYSTEM_SUFFIX}")
-
-        system_txt = "\n\n".join(system_parts)
-
-        # ── 4. بناء payload Kimi ──────────────────────────
-        payload = _kimi_build_chat_payload(
-            messages, tools, thinking, scenario, system_txt
-        )
-        if not payload:
-            yield sse_chunk("[No messages]", model=self.model_id)
-            yield sse_chunk(model=self.model_id, finish=True)
-            yield "data: [DONE]\n\n"
-            return
-
-        # ── 5. إرسال الطلب واستقبال الـ binary stream ────
-        headers = {
-            **_kimi_base_headers(device_id),
-            "Authorization":            f"Bearer {access_token}",
-            "Content-Type":             "application/connect+json",
-            "connect-protocol-version": "1",
-        }
-        encoded_body = _kimi_encode_message(payload)
-
-        full_text = ""
-        raw_buffer = b""
-
-        try:
-            async with httpx.AsyncClient(
-                timeout=REQUEST_TIMEOUT,
-                follow_redirects=True,
-            ) as client:
-                async with client.stream(
-                    "POST",
-                    f"{KIMI_BASE}/apiv2/kimi.gateway.chat.v1.ChatService/Chat",
-                    headers=headers,
-                    content=encoded_body,
-                ) as resp:
-                    if resp.status_code != 200:
-                        body = await resp.aread()
-                        log.error("Kimi HTTP %d: %s", resp.status_code, body[:200])
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"Kimi API error: {resp.status_code}",
-                        )
-                    async for chunk in resp.aiter_bytes():
-                        raw_buffer += chunk
-
-            # ── 6. تفكيك الـ frames ──────────────────────
-            frames    = _kimi_decode_frames(raw_buffer)
-            full_text = _kimi_extract_text_from_frames(frames)
-            log.info("Kimi: response %d chars from %d frames", len(full_text), len(frames))
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            log.error("Kimi stream error: %s", e, exc_info=True)
-            yield sse_chunk(f"[Kimi error: {e}]", model=self.model_id)
-            yield sse_chunk(model=self.model_id, finish=True)
-            yield "data: [DONE]\n\n"
-            return
-
-        # ── 7. تحليل: tool call أم نص عادي؟ ─────────────
-        tc = parse_tool_call(full_text)
-
-        if tc:
-            log.info("Kimi tool call: %s", tc["name"])
-            call_id = f"call_{uuid.uuid4().hex[:24]}"
-            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
-            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
-            yield "data: [DONE]\n\n"
-        else:
-            txt = clean_text(full_text)
-            chunk_size = 40
-            for i in range(0, max(len(txt), 1), chunk_size):
-                yield sse_chunk(txt[i:i + chunk_size], model=self.model_id)
-            yield sse_chunk(model=self.model_id, finish=True)
-            yield "data: [DONE]\n\n"
-
-
-# سجّل Kimi
-register_backend(KimiBackend())
-
-# ── إضافة نماذج Kimi المتعددة إلى نفس الـ backend ─────────
-for _kimi_alias in ("kimi-k2", "kimi-k3", "kimi-auto", "kimi-solve"):
-    _BACKENDS[_kimi_alias] = KimiBackend()
-
-
-# ══════════════════════════════════════════════════════════
-# تحديث chat_completions لدعم model aliases بشكل صحيح
-# (السيناريو يُستخرج من model field مباشرة)
-# ══════════════════════════════════════════════════════════
-
-# نُعدّل الـ conv_id بحيث يحمل model prefix لـ Kimi
-# حتى يعرف KimiBackend أي scenario يستخدم
-_ORIG_CHAT = app.routes  # نحتفظ بالـ routes
-
-# patch: نُعيد تعريف complete لـ KimiBackend بحيث تقرأ model من conv_id
-
-class _KimiBackendFull(KimiBackend):
-    """نسخة KimiBackend تستقبل model_override في conv_id."""
-
-    async def complete(
-        self,
-        token:    str,
-        messages: List[Dict],
-        tools:    List[Dict],
-        thinking: bool,
-        conv_id:  str,
-    ) -> AsyncIterator[str]:
-        # conv_id يحمل model prefix: "kimi-k3:abc123"
-        parts = conv_id.split(":", 1)
-        model_hint = parts[0] if len(parts) == 2 else KIMI_PROXY_ID
-
-        device_id    = _kimi_extract_device_id(token)
-        access_token = await _kimi_refresh_token(token, device_id)
-        scenario     = _kimi_get_scenario(model_hint)
-
-        system_parts = []
-        for m in messages:
-            if m.get("role") == "system":
-                c = m.get("content") or ""
-                if isinstance(c, list):
-                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
-                system_parts.append(str(c))
-        if tools:
-            system_parts.append(f"\n{tools_to_xml(tools)}\n{TOOL_SYSTEM_SUFFIX}")
-        system_txt = "\n\n".join(system_parts)
-
-        payload = _kimi_build_chat_payload(
-            messages, tools, thinking, scenario, system_txt
-        )
-        if not payload:
-            yield sse_chunk("[No messages]", model=self.model_id)
-            yield sse_chunk(model=self.model_id, finish=True)
-            yield "data: [DONE]\n\n"
-            return
-
-        headers = {
-            **_kimi_base_headers(device_id),
-            "Authorization":            f"Bearer {access_token}",
-            "Content-Type":             "application/connect+json",
-            "connect-protocol-version": "1",
-        }
-        encoded_body = _kimi_encode_message(payload)
-        full_text    = ""
-        raw_buffer   = b""
-
-        try:
-            async with httpx.AsyncClient(
-                timeout=REQUEST_TIMEOUT, follow_redirects=True,
-            ) as client:
-                async with client.stream(
-                    "POST",
-                    f"{KIMI_BASE}/apiv2/kimi.gateway.chat.v1.ChatService/Chat",
-                    headers=headers,
-                    content=encoded_body,
-                ) as resp:
-                    if resp.status_code != 200:
-                        body = await resp.aread()
-                        raise HTTPException(
-                            status_code=502,
-                            detail=f"Kimi API error: {resp.status_code} — {body[:200]}",
-                        )
-                    async for chunk in resp.aiter_bytes():
-                        raw_buffer += chunk
-
-            frames    = _kimi_decode_frames(raw_buffer)
-            full_text = _kimi_extract_text_from_frames(frames)
-            log.info("Kimi[%s] %d chars / %d frames", scenario, len(full_text), len(frames))
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            log.error("Kimi error: %s", e, exc_info=True)
-            yield sse_chunk(f"[Kimi error: {e}]", model=self.model_id)
-            yield sse_chunk(model=self.model_id, finish=True)
-            yield "data: [DONE]\n\n"
-            return
-
-        tc = parse_tool_call(full_text)
-        if tc:
-            log.info("Kimi tool call: %s", tc["name"])
-            cid = f"call_{uuid.uuid4().hex[:24]}"
-            yield sse_chunk(tc=tc, model=self.model_id, call_id=cid)
-            yield sse_chunk(tc=tc, model=self.model_id, call_id=cid, finish=True)
-            yield "data: [DONE]\n\n"
-        else:
-            txt = clean_text(full_text)
-            for i in range(0, max(len(txt), 1), 40):
-                yield sse_chunk(txt[i:i + 40], model=self.model_id)
-            yield sse_chunk(model=self.model_id, finish=True)
-            yield "data: [DONE]\n\n"
-
-
-# استبدل backends Kimi بالنسخة الكاملة
-_kimi_full = _KimiBackendFull()
-for _kid in ("kimi", "kimi-k2", "kimi-k3", "kimi-auto", "kimi-solve"):
-    _BACKENDS[_kid] = _kimi_full
-
-
-# ══════════════════════════════════════════════════════════
-# تحديث chat_completions: نمرر model إلى conv_id لـ Kimi
-# ══════════════════════════════════════════════════════════
-
-# نُلغي الـ route القديم ونُعيد تعريفه مع patch بسيط
-# (FastAPI لا يدعم override routes، لذا نستخدم middleware)
-
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
-from starlette.responses import Response as StarletteResponse
-
-
-class _KimiModelPatcher(BaseHTTPMiddleware):
-    """
-    Middleware يُعدّل conv_id لـ Kimi ليشمل model prefix.
-    يعمل بشفافية قبل وصول الطلب للـ route handler.
-    """
-    async def dispatch(
-        self, request: StarletteRequest, call_next
-    ) -> StarletteResponse:
-        # نحتاج patch فقط لـ /v1/chat/completions
-        if request.url.path == "/v1/chat/completions":
-            try:
-                body_bytes = await request.body()
-                body_obj   = json.loads(body_bytes)
-                model      = body_obj.get("model", "")
-
-                # إذا كان نموذج Kimi وما فيه conv_id بعد
-                if model in _BACKENDS and model.startswith("kimi"):
-                    existing_cid = (
-                        body_obj.get("conversation_id")
-                        or body_obj.get("session_id")
-                        or request.headers.get("x-conversation-id")
-                        or request.headers.get("x-session-id")
-                    )
-                    if not existing_cid:
-                        # نضيف prefix بالـ model حتى يُمرَّر للـ backend
-                        key_msgs = body_obj.get("messages", [])[:-1] or body_obj.get("messages", [])[:1]
-                        base_cid = hashlib.md5(
-                            json.dumps(key_msgs, ensure_ascii=False).encode()
-                        ).hexdigest()
-                        # نضيف model prefix
-                        body_obj["conversation_id"] = f"{model}:{base_cid}"
-                        # نُعيد بناء الطلب مع الـ body المعدّل
-                        new_body = json.dumps(body_obj).encode()
-
-                        async def new_receive():
-                            return {"type": "http.request", "body": new_body}
-
-                        request = StarletteRequest(request.scope, new_receive)
-            except Exception:
-                pass  # لا نكسر أي شيء
-
-        return await call_next(request)
-
-
-app.add_middleware(_KimiModelPatcher)
-
-
-# ══════════════════════════════════════════════════════════
-# تحديث list_models لإضافة نماذج Kimi
-# ══════════════════════════════════════════════════════════
-
-# نُعيد تعريف /v1/models بعد إضافة Kimi
-# (FastAPI يُعطي الأولوية للأخير في حالة التكرار)
-@app.get("/v1/models", include_in_schema=False)
-async def list_models_v2():
-    models = []
-    seen   = set()
-    for mid in _BACKENDS:
-        if mid not in seen:
-            models.append({
-                "id":       mid,
-                "object":   "model",
-                "created":  1700000000,
-                "owned_by": "kimi" if mid.startswith("kimi") else "qwen",
-            })
-            seen.add(mid)
-    models.append({
-        "id":       "qwen-vision",
-        "object":   "model",
-        "created":  1700000000,
-        "owned_by": "qwen",
-    })
-    return {"object": "list", "data": models}
-
-
-# ══════════════════════════════════════════════════════════
 # Entry Point
 # ══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info(
-        "Starting Universal AI Proxy v5.1 on port %d | backends: %s",
-        port, list(_BACKENDS.keys()),
-    )
+    log.info("Starting Universal AI Proxy v6.0 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+
+# ══════════════════════════════════════════════════════════
+# ملخص استخدام الـ API
+# ══════════════════════════════════════════════════════════
+#
+# ① Qwen:
+#    POST /v1/chat/completions
+#    Authorization: Bearer <qwen_token>
+#    {"model": "qwen", "messages": [...], "thinking": true/false}
+#
+# ② DeepSeek:
+#    POST /v1/chat/completions
+#    Authorization: Bearer <deepseek_token>
+#    {
+#      "model": "deepseek",
+#      "messages": [...],
+#      "thinking": true/false,
+#      "extra_body": {
+#        "model_type": "expert",      // أو "default"
+#        "search_enabled": true       // أو false
+#      }
+#    }
+#    - thinking chunk منفصل يُرسل كـ: data: {"type":"thinking","content":"..."}
+#    - باقي الرد بصيغة OpenAI العادية
+#
+# ③ GPT:
+#    POST /v1/chat/completions
+#    Authorization: Bearer eyJ...  (Authorization header الكامل من ChatGPT)
+#    {"model": "gpt", "messages": [...]}
+#    - thinking يُتجاهل
+#    - extra_body.cookie: "..." اختياري لتحسين الاستقرار
+#
+# ══════════════════════════════════════════════════════════
