@@ -1,24 +1,19 @@
 """
-Qwen → OpenAI-Compatible Proxy  v4.1
-======================================
-إصلاح جذري: دعم كامل لـ Function Calling / Tool Use لأجل OpenMinis
+Universal AI Proxy  v5.0
+=========================
+بروكسي موحد: Qwen (الآن) + جاهز لإضافة أي نموذج مستقبلاً
 
-المشاكل التي كانت موجودة في v3:
-  1. كان يتجاهل حقل `tools` من الطلب تماماً
-  2. كان يرسل آخر رسالة فقط لـ Qwen، ويحذف system prompt والتاريخ الكامل
-  3. كان يرد دائماً بـ finish_reason: "stop" — لا يدعم finish_reason: "tool_calls"
-  4. Qwen لا يفهم صيغة tool_calls الأصلية، فيجب محاكاتها نصياً
-
-الحل في v4:
-  ─ نحول تعريفات الأدوات إلى نص XML واضح ونضمّه في system prompt
-  ─ نحوّل كامل تاريخ المحادثة (بما فيها tool results) لـ prompt نصي متسلسل
-  ─ نطلب من Qwen الرد بصيغة XML محددة عند استدعاء أداة
-  ─ نحلّل رد Qwen: إذا طلب أداة → نرد بـ tool_calls JSON لـ OpenMinis
-                    إذا أجاب نهائياً → نرد بـ finish_reason: stop
+إصلاحات v5 مقارنة بـ v4:
+  ① الرسائل لا تُحذف — كل tool call يظهر كـ chunk منفصل في الـ stream
+  ② التفكير يعمل فعلاً — نستقبل reasoning_effort من OpenMinis ونحوّله لـ Qwen
+  ③ لا تكرار للأدوات — نرسل tool call واحداً فقط ونحمي من الـ race condition
+  ④ ترتيب صحيح: tool call → انتظار النتيجة → الخطوة التالية (بدون parallels)
+  ⑤ معمارية backend مرنة: أضف نموذجاً جديداً بكتابة class واحدة فقط
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -29,6 +24,7 @@ import re
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
@@ -38,83 +34,394 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 # ══════════════════════════════════════════════════════════
-# Config
+# Logging
 # ══════════════════════════════════════════════════════════
-BASE_QWEN_URL      = "https://chat.qwen.ai/api/v2"
-QWEN_MODEL_ID      = "qwen3.8-max"
-PROXY_MODEL_ID     = "qwen"
-REQUEST_TIMEOUT    = 180
-OSS_UPLOAD_TIMEOUT = 120
-SESSION_TTL        = 60 * 60 * 6   # 6 ساعات
-
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
-log = logging.getLogger("qwen_proxy")
+log = logging.getLogger("ai_proxy")
+
 
 # ══════════════════════════════════════════════════════════
-# Session Store  (in-memory)
+# Session Store  (in-memory، مع eviction تلقائي)
 # ══════════════════════════════════════════════════════════
+SESSION_TTL = 60 * 60 * 6   # 6 ساعات
+
 _sessions: Dict[str, Dict[str, Any]] = {}
+_session_lock = asyncio.Lock()
 
 
 def _session_key(token: str, conv_id: str) -> str:
     return f"{token[:16]}:{conv_id}"
 
 
-def _get_session(token: str, conv_id: str) -> Optional[Dict[str, Any]]:
-    sess = _sessions.get(_session_key(token, conv_id))
-    if sess:
-        sess["last_used"] = time.time()
-    return sess
+async def _get_session(token: str, conv_id: str) -> Optional[Dict]:
+    async with _session_lock:
+        sess = _sessions.get(_session_key(token, conv_id))
+        if sess:
+            sess["last_used"] = time.time()
+        return dict(sess) if sess else None
 
 
-def _set_session(token: str, conv_id: str, qwen_chat_id: str,
-                 parent_id: Optional[str] = None) -> None:
-    _sessions[_session_key(token, conv_id)] = {
-        "qwen_chat_id": qwen_chat_id,
-        "parent_id":    parent_id,
-        "last_used":    time.time(),
+async def _set_session(token: str, conv_id: str, data: Dict) -> None:
+    async with _session_lock:
+        _sessions[_session_key(token, conv_id)] = {**data, "last_used": time.time()}
+
+
+async def _update_session(token: str, conv_id: str, **kwargs) -> None:
+    async with _session_lock:
+        key = _session_key(token, conv_id)
+        if key in _sessions:
+            _sessions[key].update(kwargs)
+            _sessions[key]["last_used"] = time.time()
+
+
+async def _evict_old_sessions() -> None:
+    async with _session_lock:
+        now   = time.time()
+        stale = [k for k, v in _sessions.items() if now - v["last_used"] > SESSION_TTL]
+        for k in stale:
+            del _sessions[k]
+        if stale:
+            log.info("Evicted %d stale sessions", len(stale))
+
+
+# ══════════════════════════════════════════════════════════
+# ★ معمارية Backend المرنة
+#   لإضافة نموذج جديد: اصنع class ترث من BaseBackend
+# ══════════════════════════════════════════════════════════
+
+class BaseBackend(ABC):
+    """الواجهة التي يجب أن ينفّذها كل backend."""
+
+    @property
+    @abstractmethod
+    def model_id(self) -> str:
+        """المعرّف الذي يُرسله OpenMinis في حقل model."""
+
+    @abstractmethod
+    async def complete(
+        self,
+        token: str,
+        messages: List[Dict],
+        tools: List[Dict],
+        thinking: bool,
+        conv_id: str,
+    ) -> AsyncIterator[str]:
+        """
+        يُنتج SSE chunks بصيغة OpenAI.
+        كل chunk عبارة عن سطر "data: {...}\\n\\n"
+        آخر chunk: "data: [DONE]\\n\\n"
+        """
+
+
+# ─── سجل الـ Backends ─────────────────────────────────────
+_BACKENDS: Dict[str, BaseBackend] = {}
+
+
+def register_backend(backend: BaseBackend) -> None:
+    _BACKENDS[backend.model_id] = backend
+    log.info("Registered backend: %s", backend.model_id)
+
+
+def get_backend(model_id: str) -> Optional[BaseBackend]:
+    return _BACKENDS.get(model_id)
+
+
+# ══════════════════════════════════════════════════════════
+# أدوات مشتركة: تحويل الرسائل + تحليل Tool Calls
+# ══════════════════════════════════════════════════════════
+
+TOOL_SYSTEM_SUFFIX = """
+══════════════════════════════════════════════
+TOOL USE — STRICT FORMAT
+══════════════════════════════════════════════
+When you need to call a tool, your ENTIRE response MUST be ONLY this exact line:
+
+ACTION: tool_name|{"param1": "value1"}
+
+Examples:
+  ACTION: shell_execute|{"command": "ls -la"}
+  ACTION: browser_open|{"url": "https://example.com"}
+  ACTION: read_file|{"path": "/tmp/notes.txt"}
+
+Rules:
+  • Output ONLY the ACTION line — no words before or after it
+  • ONE tool call per response — never two at once
+  • Use valid JSON (double quotes)
+  • NEVER fabricate tool results — wait for [TOOL RESULT: ...] blocks
+  • When finished (no more tools needed) → write your answer as plain text
+
+Tool results arrive as:
+  [TOOL RESULT: tool_name]
+  ...result content...
+  [/TOOL RESULT]
+══════════════════════════════════════════════
+"""
+
+
+def tools_to_xml(tools: List[Dict]) -> str:
+    if not tools:
+        return ""
+    lines = ["<available_tools>"]
+    for tool in tools:
+        func       = tool.get("function") or tool
+        name       = func.get("name", "unknown")
+        desc       = func.get("description", "")
+        params     = func.get("parameters", {})
+        required   = params.get("required", [])
+        properties = params.get("properties", {})
+
+        lines.append("  <tool>")
+        lines.append(f"    <name>{name}</name>")
+        lines.append(f"    <description>{desc}</description>")
+        if properties:
+            lines.append("    <parameters>")
+            for pname, pinfo in properties.items():
+                ptype = pinfo.get("type", "string")
+                pdesc = pinfo.get("description", "")
+                req   = " required" if pname in required else ""
+                lines.append(
+                    f'      <param name="{pname}" type="{ptype}"{req}>{pdesc}</param>'
+                )
+            lines.append("    </parameters>")
+        lines.append("  </tool>")
+    lines.append("</available_tools>")
+    return "\n".join(lines)
+
+
+def messages_to_prompt(messages: List[Dict], tools: List[Dict]) -> Tuple[str, str]:
+    """→ (system_text, conversation_text)"""
+    system_parts = []
+    conv_parts   = []
+
+    for m in messages:
+        if m.get("role") == "system":
+            content = m.get("content") or ""
+            if isinstance(content, list):
+                content = " ".join(
+                    c.get("text", "") for c in content if isinstance(c, dict)
+                )
+            system_parts.append(str(content))
+
+    if tools:
+        system_parts.append(f"\n{tools_to_xml(tools)}\n{TOOL_SYSTEM_SUFFIX}")
+
+    for m in messages:
+        role    = m.get("role", "user")
+        content = m.get("content") or ""
+
+        if role == "system":
+            continue
+
+        elif role == "user":
+            if isinstance(content, list):
+                text_parts = []
+                for c in content:
+                    if isinstance(c, dict):
+                        if c.get("type") == "text":
+                            text_parts.append(c.get("text", ""))
+                        elif c.get("type") == "image_url":
+                            text_parts.append("[IMAGE]")
+                content = " ".join(text_parts)
+            conv_parts.append(f"User: {content}")
+
+        elif role == "assistant":
+            if isinstance(content, list):
+                content = " ".join(
+                    c.get("text", "")
+                    for c in content
+                    if isinstance(c, dict) and c.get("type") == "text"
+                )
+            tool_calls = m.get("tool_calls", [])
+            if tool_calls:
+                for tc in tool_calls:
+                    func    = tc.get("function", {})
+                    tc_name = func.get("name", "")
+                    tc_args = func.get("arguments", "{}")
+                    conv_parts.append(f"ACTION: {tc_name}|{tc_args}")
+            else:
+                conv_parts.append(f"Assistant: {content}")
+
+        elif role in ("tool", "function"):
+            tool_name = m.get("name") or m.get("tool_call_id", "tool")
+            if isinstance(content, list):
+                content = str(content)
+            conv_parts.append(
+                f"[TOOL RESULT: {tool_name}]\n{content}\n[/TOOL RESULT]"
+            )
+
+    system_text = "\n\n".join(system_parts)
+    conv_text   = "\n\n".join(conv_parts)
+    return system_text, conv_text
+
+
+def build_full_prompt(messages: List[Dict], tools: List[Dict]) -> str:
+    system_text, conv_text = messages_to_prompt(messages, tools)
+    parts = []
+    if system_text:
+        parts.append(f"[SYSTEM]\n{system_text}\n[/SYSTEM]")
+    if conv_text:
+        parts.append(conv_text)
+    parts.append("Assistant:")
+    return "\n\n".join(parts)
+
+
+# ─── تحليل رد النموذج: هل هو tool call؟ ──────────────────
+
+def parse_tool_call(text: str) -> Optional[Dict]:
+    """
+    يتعرف على tool calls بكل صيغها الممكنة.
+    يُعيد {"name": str, "arguments": str(json)} أو None.
+    """
+    # 1. ACTION: tool_name|{json}
+    m = re.search(r"(?m)^ACTION:\s*(\w+)\|(\{.*\})\s*$", text, re.DOTALL)
+    if m:
+        return _make_tc(m.group(1), m.group(2))
+
+    # 2. <tool_call><name>…</name><arguments>…</arguments></tool_call>
+    m = re.search(
+        r"<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>",
+        text, re.DOTALL | re.IGNORECASE,
+    )
+    if m:
+        return _make_tc(m.group(1), m.group(2))
+
+    # 3. <name>…</name> مع <parameter=x> (صيغة Qwen الخاصة)
+    m_name   = re.search(r"<name>(.*?)</name>", text, re.IGNORECASE)
+    m_params = re.findall(r"<parameter[=:](\w+)>\s*(.*?)\s*</parameter>", text, re.DOTALL | re.IGNORECASE)
+    if m_name and m_params:
+        params = {p: v for p, v in m_params}
+        return _make_tc(m_name.group(1).strip(), json.dumps(params, ensure_ascii=False))
+
+    return None
+
+
+def _make_tc(name: str, args_raw: str) -> Dict:
+    name = name.strip()
+    try:
+        args_obj = json.loads(args_raw)
+    except json.JSONDecodeError:
+        try:
+            args_obj = json.loads(args_raw.replace("'", '"'))
+        except Exception:
+            args_obj = {"raw": args_raw.strip()}
+    return {"name": name, "arguments": json.dumps(args_obj, ensure_ascii=False)}
+
+
+def clean_text(text: str) -> str:
+    """إزالة بقايا XML/ACTION من النص النهائي."""
+    text = re.sub(r"(?m)^ACTION:\s*\S+\|.*$", "", text)
+    text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"</?function[^>]*>", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+# ── OpenAI-compatible response builders ───────────────────
+
+def make_tc_response(tc: Dict, model: str) -> Dict:
+    call_id = f"call_{uuid.uuid4().hex[:24]}"
+    return {
+        "id":      f"chatcmpl-{uuid.uuid4().hex}",
+        "object":  "chat.completion",
+        "created": int(time.time()),
+        "model":   model,
+        "choices": [{
+            "index":   0,
+            "message": {
+                "role":    "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id":       call_id,
+                    "type":     "function",
+                    "function": {
+                        "name":      tc["name"],
+                        "arguments": tc["arguments"],
+                    },
+                }],
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
 
-def _update_parent(token: str, conv_id: str, parent_id: Optional[str]) -> None:
-    key  = _session_key(token, conv_id)
-    sess = _sessions.get(key)
-    if sess and parent_id:
-        sess["parent_id"] = parent_id
-        sess["last_used"] = time.time()
+def make_text_response(content: str, model: str) -> Dict:
+    return {
+        "id":      f"chatcmpl-{uuid.uuid4().hex}",
+        "object":  "chat.completion",
+        "created": int(time.time()),
+        "model":   model,
+        "choices": [{
+            "index":   0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
 
 
-def _evict_old_sessions() -> None:
-    now   = time.time()
-    stale = [k for k, v in _sessions.items() if now - v["last_used"] > SESSION_TTL]
-    for k in stale:
-        del _sessions[k]
-    if stale:
-        log.info("Evicted %d stale sessions", len(stale))
+def sse_chunk(
+    content: str = "",
+    model:   str = "qwen",
+    *,
+    finish:    bool = False,
+    tc:        Optional[Dict] = None,
+    call_id:   Optional[str]  = None,
+) -> str:
+    """
+    يبني SSE data line واحداً.
+    ① محتوى نصي عادي
+    ② بداية tool_call (tc مُعطى، finish=False)
+    ③ نهاية tool_call   (tc مُعطى، finish=True)
+    ④ نهاية stream       (finish=True بدون tc)
+    """
+    cid = call_id or f"call_{uuid.uuid4().hex[:24]}"
+
+    if tc and not finish:
+        delta = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "index": 0,
+                "id":    cid,
+                "type":  "function",
+                "function": {
+                    "name":      tc["name"],
+                    "arguments": tc["arguments"],
+                },
+            }],
+        }
+        choice = {"index": 0, "delta": delta, "finish_reason": None}
+
+    elif finish and tc:
+        choice = {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+
+    elif finish:
+        choice = {"index": 0, "delta": {}, "finish_reason": "stop"}
+
+    else:
+        choice = {"index": 0, "delta": {"content": content}, "finish_reason": None}
+
+    obj = {
+        "id":      f"chatcmpl-{uuid.uuid4().hex}",
+        "object":  "chat.completion.chunk",
+        "created": int(time.time()),
+        "model":   model,
+        "choices": [choice],
+    }
+    return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
 
 # ══════════════════════════════════════════════════════════
-# App
+# ★ Qwen Backend
 # ══════════════════════════════════════════════════════════
-app = FastAPI(
-    title="Qwen OpenAI-Compatible Proxy",
-    version="4.1.0",
-    docs_url="/docs",
-)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+QWEN_BASE          = "https://chat.qwen.ai/api/v2"
+QWEN_MODEL_ID_REAL = "qwen3.8-max"
+QWEN_PROXY_ID      = "qwen"
 
-# ══════════════════════════════════════════════════════════
-# Headers
-# ══════════════════════════════════════════════════════════
 _UA_CHAT = (
     "Dalvik/2.1.0 (Linux; U; Android 15; RMX3834 Build/AP3A.240905.015.A2) "
     "AliApp(QWENCHAT/2.7.2) AppType/Release AplusBridgeLite"
@@ -125,14 +432,15 @@ _UA_NEW = (
     "AliApp(QWENCHAT/2.7.2) AppType/Release AplusBridgeLite"
 )
 
+REQUEST_TIMEOUT = 180
 
-def _headers_chat(token: str, *, stream: bool = False) -> Dict[str, str]:
+
+def _qwen_headers_chat(token: str, *, stream: bool = False) -> Dict[str, str]:
     return {
         "User-Agent":      _UA_CHAT,
         "Content-Type":    "application/json; charset=UTF-8",
         "Accept":          "*/*,text/event-stream" if stream else "application/json",
         "Accept-Language": "en-US",
-        "Accept-Charset":  "UTF-8",
         "Accept-Encoding": "gzip, deflate",
         "Cache-Control":   "no-store",
         "Connection":      "Keep-Alive",
@@ -146,7 +454,7 @@ def _headers_chat(token: str, *, stream: bool = False) -> Dict[str, str]:
     }
 
 
-def _headers_new(token: str) -> Dict[str, str]:
+def _qwen_headers_new(token: str) -> Dict[str, str]:
     return {
         "User-Agent":      _UA_NEW,
         "Content-Type":    "application/json",
@@ -164,14 +472,7 @@ def _headers_new(token: str) -> Dict[str, str]:
     }
 
 
-def _extract_token(authorization: Optional[str]) -> str:
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header.")
-    parts = authorization.split(" ", 1)
-    return parts[1].strip() if len(parts) == 2 else parts[0].strip()
-
-
-def _is_rate_limited(obj: Any) -> bool:
+def _qwen_is_rate_limited(obj: Any) -> bool:
     if isinstance(obj, str):
         return "RateLimited" in obj
     if isinstance(obj, dict):
@@ -187,261 +488,20 @@ def _is_rate_limited(obj: Any) -> bool:
     return False
 
 
-def _is_antibot(line: str) -> bool:
+def _qwen_is_antibot(line: str) -> bool:
     return "_____tmd_____" in line or "punish" in line
 
 
-# ══════════════════════════════════════════════════════════
-# ★★★ الجزء الجديد: تحويل Tools → Prompt نصي ★★★
-# ══════════════════════════════════════════════════════════
-
-TOOL_SYSTEM_SUFFIX = """
-══════════════════════════════════════
-TOOL USE INSTRUCTIONS
-══════════════════════════════════════
-You have access to the tools listed in <available_tools> above.
-
-CRITICAL RULE: When you need to call a tool, your ENTIRE response must be ONLY this one line — no text before it, no text after it:
-
-ACTION: tool_name|{"param1": "value1", "param2": "value2"}
-
-Real examples:
-ACTION: shell_execute|{"command": "uname -a"}
-ACTION: browser_open|{"url": "https://example.com"}
-ACTION: read_file|{"path": "/home/user/file.txt"}
-ACTION: write_file|{"path": "/tmp/out.txt", "content": "hello"}
-
-When you have a FINAL answer and no more tools are needed, write your response as normal text with NO "ACTION:" prefix.
-
-Rules:
-- Output ONLY the ACTION line when calling a tool — zero extra words
-- Use valid JSON for the arguments (double quotes, proper escaping)
-- ONE tool call per response
-- NEVER invent tool results — wait for the system to execute and return them
-- Tool results arrive as: [TOOL RESULT: tool_name] ... [/TOOL RESULT]
-══════════════════════════════════════
-"""
-
-
-def _tools_to_xml(tools: List[Dict]) -> str:
-    """تحويل تعريفات الأدوات بصيغة OpenAI إلى نص XML مقروء."""
-    if not tools:
-        return ""
-    lines = ["<available_tools>"]
-    for tool in tools:
-        # صيغة OpenAI: {"type": "function", "function": {...}}
-        func = tool.get("function") or tool
-        name = func.get("name", "unknown")
-        desc = func.get("description", "")
-        params = func.get("parameters", {})
-        required = params.get("required", [])
-        properties = params.get("properties", {})
-
-        lines.append(f"  <tool>")
-        lines.append(f"    <name>{name}</name>")
-        lines.append(f"    <description>{desc}</description>")
-        if properties:
-            lines.append(f"    <parameters>")
-            for pname, pinfo in properties.items():
-                ptype = pinfo.get("type", "string")
-                pdesc = pinfo.get("description", "")
-                req   = " (required)" if pname in required else " (optional)"
-                lines.append(f"      <param name=\"{pname}\" type=\"{ptype}\"{req}>{pdesc}</param>")
-            lines.append(f"    </parameters>")
-        lines.append(f"  </tool>")
-    lines.append("</available_tools>")
-    return "\n".join(lines)
-
-
-def _messages_to_full_prompt(messages: List[Dict], tools: List[Dict]) -> Tuple[str, str]:
-    """
-    تحويل كامل قائمة الرسائل إلى:
-    - system_text: النص الكامل للـ system prompt
-    - conversation_text: نص المحادثة كاملاً
-
-    يدعم رسائل: system, user, assistant, tool
-    """
-    system_parts = []
-    conversation_parts = []
-
-    # أولاً نجمع كل system messages
-    for m in messages:
-        if m.get("role") == "system":
-            content = m.get("content") or ""
-            if isinstance(content, list):
-                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
-            system_parts.append(str(content))
-
-    # إذا كان فيه أدوات، نضيف تعريفها وتعليمات الاستخدام
-    if tools:
-        system_parts.append(f"\n{_tools_to_xml(tools)}\n{TOOL_SYSTEM_SUFFIX}")
-
-    # ثانياً نحول باقي الرسائل إلى نص محادثة
-    for m in messages:
-        role    = m.get("role", "user")
-        content = m.get("content") or ""
-
-        if role == "system":
-            # تم معالجتها بالفعل
-            continue
-
-        elif role == "user":
-            if isinstance(content, list):
-                # قد يحتوي على نصوص وصور
-                text_parts = []
-                for c in content:
-                    if isinstance(c, dict):
-                        if c.get("type") == "text":
-                            text_parts.append(c.get("text", ""))
-                        elif c.get("type") == "image_url":
-                            text_parts.append("[IMAGE]")
-                content = " ".join(text_parts)
-            conversation_parts.append(f"User: {content}")
-
-        elif role == "assistant":
-            if isinstance(content, list):
-                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
-
-            # إذا كانت الرسالة تحتوي على tool_calls من دورة سابقة
-            tool_calls = m.get("tool_calls", [])
-            if tool_calls:
-                for tc in tool_calls:
-                    func = tc.get("function", {})
-                    tc_name = func.get("name", "")
-                    tc_args = func.get("arguments", "{}")
-                    conversation_parts.append(
-                        f"Assistant: <tool_call><name>{tc_name}</name><arguments>{tc_args}</arguments></tool_call>"
-                    )
-            else:
-                conversation_parts.append(f"Assistant: {content}")
-
-        elif role == "tool":
-            # نتيجة تنفيذ أداة من OpenMinis
-            tool_call_id = m.get("tool_call_id", "")
-            tool_name    = m.get("name", tool_call_id)
-            if isinstance(content, list):
-                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
-            conversation_parts.append(
-                f"[TOOL RESULT: {tool_name}]\n{content}\n[/TOOL RESULT]"
-            )
-
-        elif role == "function":
-            # صيغة قديمة
-            func_name = m.get("name", "function")
-            if isinstance(content, list):
-                content = str(content)
-            conversation_parts.append(
-                f"[TOOL RESULT: {func_name}]\n{content}\n[/TOOL RESULT]"
-            )
-
-    system_text       = "\n\n".join(system_parts)
-    conversation_text = "\n\n".join(conversation_parts)
-    return system_text, conversation_text
-
-
-def _build_full_prompt(messages: List[Dict], tools: List[Dict]) -> str:
-    """
-    بناء البرومبت الكامل الذي يُرسل لـ Qwen
-    """
-    system_text, conversation_text = _messages_to_full_prompt(messages, tools)
-
-    parts = []
-    if system_text:
-        parts.append(f"[SYSTEM]\n{system_text}\n[/SYSTEM]")
-    if conversation_text:
-        parts.append(conversation_text)
-    parts.append("Assistant:")  # نطلب من Qwen الرد
-
-    return "\n\n".join(parts)
-
-
-# ══════════════════════════════════════════════════════════
-# ★★★ تحليل رد Qwen: هل هو tool_call أم إجابة نهائية؟ ★★★
-# محلل شامل يستوعب كل الصيغ التي يُخرجها Qwen
-# ══════════════════════════════════════════════════════════
-
-def _parse_tool_call(text: str) -> Optional[Dict]:
-    """
-    يحاول استخراج tool call من رد Qwen بأي صيغة.
-    يدعم:
-      1. ACTION: tool_name|{json}          ← الصيغة المطلوبة منه
-      2. <name>X</name><parameter=Y>Z</parameter>  ← ما يُخرجه Qwen أحياناً
-      3. <tool_call><name>X</name><arguments>{json}</arguments></tool_call>  ← صيغتنا الأصلية
-    يُعيد {"name": str, "arguments": str(json)} أو None.
-    """
-
-    # ── 1. الصيغة الجديدة: ACTION: tool_name|{...} ──────────
-    # تبحث في كل سطر للمرونة
-    m = re.search(r'(?m)^ACTION:\s*(\w+)\|(\{.*?\})\s*$', text, re.DOTALL)
-    if m:
-        tool_name = m.group(1).strip()
-        args_raw  = m.group(2).strip()
-        try:
-            args_obj = json.loads(args_raw)
-        except json.JSONDecodeError:
-            try:
-                args_obj = json.loads(args_raw.replace("'", '"'))
-            except Exception:
-                args_obj = {"raw": args_raw}
-        log.info("Parsed ACTION format: %s", tool_name)
-        return {"name": tool_name, "arguments": json.dumps(args_obj, ensure_ascii=False)}
-
-    # ── 2. صيغة Qwen الفعلية: <name>X</name> <parameter=Y> Z </parameter> ──
-    # هذا ما يخرجه Qwen من تلقاء نفسه بدون تعليمات واضحة
-    m_name = re.search(r'<name>(.*?)</name>', text, re.DOTALL | re.IGNORECASE)
-    m_params = re.findall(r'<parameter[=:](\w+)>\s*(.*?)\s*</parameter>', text, re.DOTALL | re.IGNORECASE)
-    if m_name and m_params:
-        tool_name = m_name.group(1).strip()
-        params    = {}
-        for pname, pval in m_params:
-            params[pname.strip()] = pval.strip()
-        # الـ parameter الأول غالباً هو الرئيسي (command, url, path...)
-        log.info("Parsed Qwen parameter= format: %s params=%s", tool_name, list(params.keys()))
-        return {"name": tool_name, "arguments": json.dumps(params, ensure_ascii=False)}
-
-    # ── 3. صيغتنا الأصلية: <tool_call><name>X</name><arguments>{json}</arguments></tool_call> ──
-    m = re.search(
-        r'<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>',
-        text, re.DOTALL | re.IGNORECASE
-    )
-    if m:
-        tool_name = m.group(1).strip()
-        args_raw  = m.group(2).strip()
-        try:
-            args_obj = json.loads(args_raw)
-        except json.JSONDecodeError:
-            try:
-                args_obj = json.loads(args_raw.replace("'", '"'))
-            except Exception:
-                args_obj = {"raw": args_raw}
-        log.info("Parsed original XML format: %s", tool_name)
-        return {"name": tool_name, "arguments": json.dumps(args_obj, ensure_ascii=False)}
-
-    # ── 4. آخر محاولة: أي شيء يبدو كـ tool call بمجرد وجود <name> ──
-    # (عندما يُغلق Qwen بـ </function> بدلاً من </tool_call>)
-    m_name2 = re.search(r'<name>(.*?)</name>', text, re.IGNORECASE)
-    if m_name2 and ('<parameter' in text.lower() or '<argument' in text.lower()):
-        tool_name = m_name2.group(1).strip()
-        # استخرج أي شيء يبدو كأمر
-        m_cmd = re.search(r'<parameter[^>]*>\s*(.*?)\s*(?:</parameter>|</function>)', text, re.DOTALL | re.IGNORECASE)
-        cmd_val = m_cmd.group(1).strip() if m_cmd else ""
-        if tool_name and cmd_val:
-            log.info("Parsed fallback format: %s", tool_name)
-            return {"name": tool_name, "arguments": json.dumps({"command": cmd_val}, ensure_ascii=False)}
-
-    return None
-
-
-# ══════════════════════════════════════════════════════════
-# Qwen Chat API
-# ══════════════════════════════════════════════════════════
-
-async def _create_chat(token: str, client: httpx.AsyncClient) -> str:
-    url     = f"{BASE_QWEN_URL}/chats/new"
+async def _qwen_create_chat(token: str, client: httpx.AsyncClient) -> str:
+    url     = f"{QWEN_BASE}/chats/new"
     payload = {"chat_mode": "normal", "project_id": ""}
-    resp    = await client.post(url, json=payload, headers=_headers_new(token), timeout=60)
-    data    = resp.json()
-    cid = (
+    resp    = await client.post(
+        url, json=payload,
+        headers=_qwen_headers_new(token),
+        timeout=60,
+    )
+    data = resp.json()
+    cid  = (
         data.get("chat_id")
         or data.get("id")
         or (data.get("data") or {}).get("chat_id")
@@ -449,57 +509,53 @@ async def _create_chat(token: str, client: httpx.AsyncClient) -> str:
     )
     if not cid:
         raise HTTPException(status_code=502, detail=f"Failed to create Qwen chat: {data}")
-    log.info("Created qwen chat_id=%s", cid)
+    log.info("Qwen: created chat_id=%s", cid)
     return cid
 
 
-def _build_message_payload(
-    chat_id: str,
-    prompt: str,
-    *,
+def _qwen_build_payload(
+    chat_id:   str,
+    prompt:    str,
     parent_id: Optional[str],
-    stream: bool = True,
-    chat_type: str = "t2t",
-    uploaded_files: Optional[List[Dict]] = None,
-    thinking: bool = False,
+    *,
+    chat_type:  str  = "t2t",
+    thinking:   bool = False,
     auto_search: bool = False,
-    size: str = "1:1",
-) -> Dict[str, Any]:
+    files:      Optional[List] = None,
+    size:       str  = "1:1",
+) -> Dict:
     ts  = int(time.time())
     fid = str(uuid.uuid4())
-
-    msg: Dict[str, Any] = {
-        "id":         None,
-        "fid":        fid,
-        "chat_type":  chat_type,
-        "content":    prompt,
-        "role":       "user",
-        "feature_config": {
-            "output_schema":    "phase",
-            "thinking_enabled": thinking,
-            "thinking_format":  "summary",
-            "auto_thinking":    thinking,
-            "auto_search":      auto_search,
-        },
-        "timestamp":     ts,
-        "sub_chat_type": chat_type,
-        "models":        [QWEN_MODEL_ID],
-        "model":         "",
-        "files":         uploaded_files or [],
-        "user_action":   "chat",
-        "extra":         {"meta": {"subChatType": chat_type}},
-        "parentId":      parent_id,
-        "parent_id":     parent_id,
-    }
-
     return {
-        "stream":                   stream,
-        "incremental_output":       True,
-        "chatId":                   chat_id,
-        "chat_id":                  chat_id,
-        "chat_mode":                "normal",
-        "model":                    QWEN_MODEL_ID,
-        "messages":                 [msg],
+        "stream":             True,
+        "incremental_output": True,
+        "chatId":             chat_id,
+        "chat_id":            chat_id,
+        "chat_mode":          "normal",
+        "model":              QWEN_MODEL_ID_REAL,
+        "messages": [{
+            "id":         None,
+            "fid":        fid,
+            "chat_type":  chat_type,
+            "content":    prompt,
+            "role":       "user",
+            "feature_config": {
+                "output_schema":    "phase",
+                "thinking_enabled": thinking,
+                "thinking_format":  "summary",
+                "auto_thinking":    thinking,
+                "auto_search":      auto_search,
+            },
+            "timestamp":     ts,
+            "sub_chat_type": chat_type,
+            "models":        [QWEN_MODEL_ID_REAL],
+            "model":         "",
+            "files":         files or [],
+            "user_action":   "chat",
+            "extra":         {"meta": {"subChatType": chat_type}},
+            "parentId":      parent_id,
+            "parent_id":     parent_id,
+        }],
         "timestamp":                ts,
         "size":                     size,
         "share_id":                 "",
@@ -510,66 +566,53 @@ def _build_message_payload(
     }
 
 
-def _extract_response_id(obj: Dict) -> Optional[str]:
-    rid = obj.get("response_id")
-    if rid:
-        return rid
-    choices = obj.get("choices", [])
-    if choices and isinstance(choices[0], dict):
-        delta = choices[0].get("delta", {})
-        rid = delta.get("response_id") or delta.get("id")
-        if rid:
-            return rid
-    return None
-
-
-# ══════════════════════════════════════════════════════════
-# SSE Stream من Qwen + جمع الرد الكامل
-# ══════════════════════════════════════════════════════════
-
-async def _stream_from_qwen_collect_all(
-    token: str,
-    chat_id: str,
-    payload: Dict,
-    client: httpx.AsyncClient,
+async def _qwen_stream_collect(
+    token:    str,
+    chat_id:  str,
+    payload:  Dict,
+    client:   httpx.AsyncClient,
 ) -> Tuple[str, Optional[str]]:
-    """
-    يقرأ الـ stream من Qwen ويجمع الرد الكامل كنص.
-    يُعيد (full_text, response_id).
-    """
-    url      = f"{BASE_QWEN_URL}/chat/completions"
-    headers  = _headers_chat(token, stream=True)
+    """جمع الرد الكامل من Qwen. يُعيد (full_text, response_id)."""
+    url      = f"{QWEN_BASE}/chat/completions"
     full_txt = ""
     resp_id: Optional[str] = None
 
     async with client.stream(
         "POST", url,
         json=payload,
-        headers=headers,
+        headers=_qwen_headers_chat(token, stream=True),
         params={"chat_id": chat_id},
         timeout=REQUEST_TIMEOUT,
     ) as resp:
         async for raw_line in resp.aiter_lines():
             if not raw_line:
                 continue
-            if _is_antibot(raw_line):
-                full_txt += "[BLOCKED: Qwen anti-bot triggered]"
+            if _qwen_is_antibot(raw_line):
+                log.warning("Qwen anti-bot triggered")
                 break
-            if _is_rate_limited(raw_line):
+            if _qwen_is_rate_limited(raw_line):
                 full_txt += "[ERROR: Rate limited]"
                 break
             if not raw_line.startswith("data: "):
                 continue
-            data_str = raw_line[6:].strip()
-            if data_str == "[DONE]":
+            ds = raw_line[6:].strip()
+            if ds == "[DONE]":
                 break
             try:
-                obj = json.loads(data_str)
-                if _is_rate_limited(obj):
+                obj = json.loads(ds)
+                if _qwen_is_rate_limited(obj):
                     full_txt += "[ERROR: Rate limited]"
                     break
 
-                rid = _extract_response_id(obj)
+                # استخرج response_id
+                rid = (
+                    obj.get("response_id")
+                    or (
+                        obj.get("choices", [{}])[0]
+                        .get("delta", {})
+                        .get("response_id")
+                    )
+                )
                 if rid:
                     resp_id = rid
 
@@ -583,141 +626,241 @@ async def _stream_from_qwen_collect_all(
                 content = delta.get("content", "")
                 if content:
                     full_txt += content
-            except (json.JSONDecodeError, KeyError):
+            except (json.JSONDecodeError, KeyError, IndexError):
                 continue
 
     return full_txt, resp_id
 
 
-# ══════════════════════════════════════════════════════════
-# بناء ردود OpenAI-compatible
-# ══════════════════════════════════════════════════════════
+class QwenBackend(BaseBackend):
+    """Backend يتصل بـ Qwen عبر موقع chat.qwen.ai."""
 
-def _make_tool_call_response(tool_call: Dict, model: str) -> Dict:
-    """رد بصيغة OpenAI عند استدعاء أداة."""
-    call_id = f"call_{uuid.uuid4().hex[:24]}"
-    return {
-        "id":      f"chatcmpl-{uuid.uuid4().hex}",
-        "object":  "chat.completion",
-        "created": int(time.time()),
-        "model":   model,
-        "choices": [{
-            "index":   0,
-            "message": {
-                "role":    "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id":       call_id,
-                    "type":     "function",
-                    "function": {
-                        "name":      tool_call["name"],
-                        "arguments": tool_call["arguments"],
-                    }
-                }]
-            },
-            "finish_reason": "tool_calls",  # ← هذا المهم!
-        }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
+    @property
+    def model_id(self) -> str:
+        return QWEN_PROXY_ID
+
+    async def complete(
+        self,
+        token:    str,
+        messages: List[Dict],
+        tools:    List[Dict],
+        thinking: bool,
+        conv_id:  str,
+    ) -> AsyncIterator[str]:
+        """
+        ينتج SSE chunks بصيغة OpenAI.
+
+        FIX ①: كل tool call يُرسَل كـ chunk مستقل → لا تُحذف رسالة
+        FIX ②: thinking يُفعَّل من حقل thinking في الطلب
+        FIX ③: حماية من تكرار tool calls بمفتاح idempotency
+        """
+        # ── بناء البرومبت الكامل ───────────────────────────
+        prompt = build_full_prompt(messages, tools)
+        if not prompt.strip():
+            return
+
+        await _evict_old_sessions()
+
+        # ── استرجاع أو إنشاء جلسة Qwen ───────────────────
+        sess = await _get_session(token, conv_id)
+        if sess:
+            qwen_chat_id = sess["qwen_chat_id"]
+            parent_id    = sess.get("parent_id")
+            log.info("Reusing qwen_chat_id=%s", qwen_chat_id)
+        else:
+            async with httpx.AsyncClient() as tmp:
+                qwen_chat_id = await _qwen_create_chat(token, tmp)
+            parent_id = None
+            await _set_session(token, conv_id, {
+                "qwen_chat_id": qwen_chat_id,
+                "parent_id":    parent_id,
+            })
+
+        payload = _qwen_build_payload(
+            qwen_chat_id, prompt, parent_id,
+            thinking=thinking,
+        )
+
+        # ── جمع رد Qwen (نجمع كاملاً لأن التحليل يحتاج النص كله) ─
+        async with httpx.AsyncClient() as client:
+            qwen_text, last_rid = await _qwen_stream_collect(
+                token, qwen_chat_id, payload, client
+            )
+
+        await _update_session(token, conv_id, parent_id=last_rid)
+        log.info("Qwen response: %d chars | parent=%s", len(qwen_text), last_rid)
+
+        # ── تحليل الرد ────────────────────────────────────
+        tc = parse_tool_call(qwen_text)
+
+        if tc:
+            log.info("Tool call: %s", tc["name"])
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            # FIX ①: نُرسل tool call كـ chunk → يظهر في الـ UI ولا يُحذف
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
+            yield "data: [DONE]\n\n"
+        else:
+            txt = clean_text(qwen_text)
+            # نُرسل النص على شكل chunks صغيرة
+            chunk_size = 40
+            for i in range(0, len(txt), chunk_size):
+                yield sse_chunk(txt[i:i+chunk_size], model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
 
 
-def _make_text_response(content: str, model: str) -> Dict:
-    """رد بصيغة OpenAI عند الإجابة النهائية."""
-    return {
-        "id":      f"chatcmpl-{uuid.uuid4().hex}",
-        "object":  "chat.completion",
-        "created": int(time.time()),
-        "model":   model,
-        "choices": [{
-            "index":   0,
-            "message": {"role": "assistant", "content": content},
-            "finish_reason": "stop",
-        }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
-
-
-def _make_stream_chunk(content: str, model: str, *,
-                       finish: bool = False,
-                       tool_call: Optional[Dict] = None,
-                       tool_call_index: int = 0) -> str:
-    """SSE chunk لـ streaming mode."""
-    chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
-
-    if tool_call and not content:
-        # Streaming tool_calls: نرسل في عدة chunks كما تفعل OpenAI
-        # chunk 1: tool_calls delta (function name + start of arguments)
-        delta = {
-            "tool_calls": [{
-                "index": tool_call_index,
-                "id":    f"call_{uuid.uuid4().hex[:24]}",
-                "type":  "function",
-                "function": {
-                    "name":      tool_call["name"],
-                    "arguments": tool_call["arguments"],
-                }
-            }]
-        }
-        choice = {"index": 0, "delta": delta, "finish_reason": None}
-    elif finish and tool_call:
-        # الـ chunk الأخير عند tool_call
-        choice = {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
-    elif finish:
-        choice = {"index": 0, "delta": {}, "finish_reason": "stop"}
-    else:
-        choice = {"index": 0, "delta": {"content": content}, "finish_reason": None}
-
-    obj = {
-        "id":      chunk_id,
-        "object":  "chat.completion.chunk",
-        "created": int(time.time()),
-        "model":   model,
-        "choices": [choice],
-    }
-    return f"data: {json.dumps(obj)}\n\n"
+# سجّل Qwen كـ default backend
+register_backend(QwenBackend())
 
 
 # ══════════════════════════════════════════════════════════
-# Routes
+# ★ FIX ②: معالجة thinking من OpenMinis
+#
+# OpenMinis يُرسل reasoning_effort: "low"/"medium"/"high"/"none"
+# عند تفعيل زر التفكير في الإعدادات.
+# نحوّله إلى bool لـ Qwen (الذي يفهم thinking_enabled فقط).
 # ══════════════════════════════════════════════════════════
 
+def resolve_thinking(body: Dict) -> bool:
+    """
+    يستخرج قيمة التفكير من أي صيغة ترسلها OpenMinis:
+      - reasoning_effort: "none" → False
+      - reasoning_effort: أي قيمة أخرى → True
+      - thinking: true/false (صيغة قديمة)
+    """
+    effort = body.get("reasoning_effort")
+    if effort is not None:
+        return str(effort).lower() not in ("none", "off", "false", "0", "")
+
+    # Anthropic-style: thinking: {"type": "enabled"/"disabled"}
+    think_obj = body.get("thinking")
+    if isinstance(think_obj, dict):
+        t = think_obj.get("type", "")
+        return t not in ("disabled", "none", "")
+    if isinstance(think_obj, bool):
+        return think_obj
+
+    return False
+
+
+# ══════════════════════════════════════════════════════════
+# ★ FIX ③: حماية من تكرار tool calls
+#
+# OpenMinis أحياناً يُرسل نفس الطلب مرتين بسرعة.
+# نستخدم deduplication بناءً على hash للطلب.
+# ══════════════════════════════════════════════════════════
+
+_recent_requests: Dict[str, float] = {}
+_req_lock = asyncio.Lock()
+DEDUP_WINDOW = 3.0  # ثوانٍ
+
+
+async def _is_duplicate(req_hash: str) -> bool:
+    async with _req_lock:
+        now = time.time()
+        # نظّف القديم
+        stale = [k for k, t in _recent_requests.items() if now - t > DEDUP_WINDOW * 10]
+        for k in stale:
+            del _recent_requests[k]
+        # تحقق
+        if req_hash in _recent_requests:
+            if now - _recent_requests[req_hash] < DEDUP_WINDOW:
+                return True
+        _recent_requests[req_hash] = now
+        return False
+
+
+def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
+    try:
+        raw = json.dumps({"m": messages[-2:], "t": tools}, ensure_ascii=False, sort_keys=True)
+        return hashlib.md5(raw.encode()).hexdigest()
+    except Exception:
+        return str(uuid.uuid4())
+
+
+# ══════════════════════════════════════════════════════════
+# FastAPI App
+# ══════════════════════════════════════════════════════════
+
+app = FastAPI(
+    title="Universal AI Proxy",
+    version="5.0.0",
+    docs_url="/docs",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def _extract_token(authorization: Optional[str]) -> str:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header.")
+    parts = authorization.split(" ", 1)
+    return parts[1].strip() if len(parts) == 2 else parts[0].strip()
+
+
+# ── Health ─────────────────────────────────────────────────
 @app.get("/", tags=["health"])
 async def health():
-    _evict_old_sessions()
     return {
         "status":          "ok",
-        "proxy":           "Qwen OpenAI-Compatible Proxy",
-        "version":         "4.1.0",
+        "proxy":           "Universal AI Proxy",
+        "version":         "5.0.0",
         "active_sessions": len(_sessions),
-        "features":        ["tool_calls", "system_prompt", "full_history", "streaming"],
-    }
-
-
-@app.get("/v1/models", tags=["models"])
-async def list_models():
-    return {
-        "object": "list",
-        "data": [
-            {"id": PROXY_MODEL_ID, "object": "model", "created": 1700000000, "owned_by": "qwen"},
-            {"id": "qwen-vision",  "object": "model", "created": 1700000000, "owned_by": "qwen"},
+        "backends":        list(_BACKENDS.keys()),
+        "fixes":           [
+            "messages-not-deleted",
+            "thinking-toggle",
+            "no-duplicate-tool-calls",
+            "sequential-tool-execution",
+            "multi-backend-architecture",
         ],
     }
 
 
-# ─── Chat Completions ─────────────────────────────────────
+# ── Models ─────────────────────────────────────────────────
+@app.get("/v1/models", tags=["models"])
+async def list_models():
+    models = []
+    for mid in _BACKENDS:
+        models.append({
+            "id":         mid,
+            "object":     "model",
+            "created":    1700000000,
+            "owned_by":   "proxy",
+        })
+    # إضافة الصورة (image generation) لـ qwen
+    models.append({
+        "id":         "qwen-vision",
+        "object":     "model",
+        "created":    1700000000,
+        "owned_by":   "qwen",
+    })
+    return {"object": "list", "data": models}
+
+
+# ── Chat Completions ────────────────────────────────────────
 @app.post("/v1/chat/completions", tags=["chat"])
 async def chat_completions(
-    request: Request,
+    request:       Request,
     authorization: Optional[str] = Header(None),
 ):
-    token     = _extract_token(authorization)
-    body      = await request.json()
+    token = _extract_token(authorization)
+    body  = await request.json()
+
     messages  = body.get("messages", [])
-    tools     = body.get("tools", [])         # ★ جديد: نقرأ الأدوات
+    tools     = body.get("tools", [])
     do_stream = body.get("stream", False)
-    model     = body.get("model", PROXY_MODEL_ID)
-    thinking    = bool(body.get("thinking", False))
-    auto_search = bool(body.get("auto_search", False))
+    model     = body.get("model", QWEN_PROXY_ID)
+
+    # FIX ②: استخراج thinking بشكل صحيح
+    thinking = resolve_thinking(body)
+    log.info("thinking=%s (reasoning_effort=%r)", thinking, body.get("reasoning_effort"))
 
     # ── معرّف المحادثة ──────────────────────────────────
     conv_id = (
@@ -727,99 +870,84 @@ async def chat_completions(
         or request.headers.get("x-session-id")
     )
     if not conv_id:
-        # اصنع معرّفاً ثابتاً من أول رسائل المحادثة (استثناء آخر رسالة)
         key_msgs = messages[:-1] if len(messages) > 1 else messages[:1]
         conv_id  = hashlib.md5(
             json.dumps(key_msgs, ensure_ascii=False).encode()
         ).hexdigest()
 
-    log.info("conv_id=%s | messages=%d | tools=%d | stream=%s",
-             conv_id, len(messages), len(tools), do_stream)
-
-    # ★ بناء البرومبت الكامل (system + كل التاريخ + تعريفات الأدوات)
-    full_prompt = _build_full_prompt(messages, tools)
-    log.debug("Full prompt length: %d chars", len(full_prompt))
-
-    if not full_prompt.strip():
-        raise HTTPException(status_code=400, detail="No messages found.")
-
-    _evict_old_sessions()
-
-    # ── تحديد/إنشاء qwen_chat_id ──────────────────────
-    sess = _get_session(token, conv_id)
-    if sess:
-        qwen_chat_id = sess["qwen_chat_id"]
-        parent_id    = sess["parent_id"]
-        log.info("Reusing qwen_chat_id=%s (parent=%s)", qwen_chat_id, parent_id)
-    else:
-        async with httpx.AsyncClient() as tmp:
-            qwen_chat_id = await _create_chat(token, tmp)
-        parent_id = None
-        _set_session(token, conv_id, qwen_chat_id, parent_id)
-        log.info("New session: conv_id=%s → qwen_chat_id=%s", conv_id, qwen_chat_id)
-
-    payload = _build_message_payload(
-        qwen_chat_id, full_prompt,
-        parent_id=parent_id,
-        stream=True,
-        chat_type="t2t",
-        thinking=thinking,
-        auto_search=auto_search,
-    )
-
-    # ── جمع الرد الكامل من Qwen أولاً (نحتاج التحليل قبل الرد) ──
-    async with httpx.AsyncClient() as client:
-        qwen_text, last_rid = await _stream_from_qwen_collect_all(
-            token, qwen_chat_id, payload, client
+    # FIX ③: deduplication
+    req_hash = _request_hash(messages, tools)
+    if await _is_duplicate(req_hash):
+        log.warning("Duplicate request detected (conv=%s) — skipping", conv_id)
+        # أرجع 429 لـ OpenMinis ليعيد المحاولة بعد لحظة
+        raise HTTPException(
+            status_code=429,
+            detail="Duplicate request — please retry in a moment.",
         )
 
-    _update_parent(token, conv_id, last_rid)
-    log.info("Qwen response length: %d chars | parent_id=%s", len(qwen_text), last_rid)
+    log.info(
+        "conv=%s | model=%s | msgs=%d | tools=%d | stream=%s | thinking=%s",
+        conv_id, model, len(messages), len(tools), do_stream, thinking,
+    )
 
-    # ★ التحليل: هل طلب Qwen أداة؟
-    parsed_tool = _parse_tool_call(qwen_text)
+    # ── اختر الـ backend ───────────────────────────────
+    backend = get_backend(model) or get_backend(QWEN_PROXY_ID)
+    if backend is None:
+        raise HTTPException(status_code=400, detail=f"No backend for model '{model}'.")
 
-    if parsed_tool:
-        log.info("Tool call detected: %s", parsed_tool["name"])
+    # ── Streaming ─────────────────────────────────────
+    if do_stream:
+        async def event_stream():
+            async for chunk in backend.complete(token, messages, tools, thinking, conv_id):
+                yield chunk
 
-        if do_stream:
-            # streaming مع tool_calls
-            async def tool_stream():
-                yield _make_stream_chunk("", model, tool_call=parsed_tool)
-                yield _make_stream_chunk("", model, finish=True, tool_call=parsed_tool)
-                yield "data: [DONE]\n\n"
-            return StreamingResponse(tool_stream(), media_type="text/event-stream")
-        else:
-            return JSONResponse(_make_tool_call_response(parsed_tool, model))
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    else:
-        # إجابة نصية عادية
-        # نزيل أي بقايا XML/ACTION قد تكون تسرّبت
-        clean_text = qwen_text
-        # إزالة صيغة ACTION: إذا لم تُحلَّل كأداة (خطأ في التنسيق مثلاً)
-        clean_text = re.sub(r'(?m)^ACTION:\s*\S+\|.*$', '', clean_text)
-        # إزالة بقايا XML
-        clean_text = re.sub(r'<tool_call>.*?</tool_call>', '', clean_text, flags=re.DOTALL | re.IGNORECASE)
-        clean_text = re.sub(r'</?function>', '', clean_text, flags=re.IGNORECASE)
-        clean_text = clean_text.strip()
+    # ── Non-streaming: جمع الـ chunks وتحويلها لـ JSON ─
+    full_content = ""
+    finish_reason = "stop"
+    tool_call_data = None
+    call_id_data   = None
 
-        if do_stream:
-            async def text_stream():
-                # نرسل النص على شكل chunks صغيرة
-                chunk_size = 20
-                for i in range(0, len(clean_text), chunk_size):
-                    yield _make_stream_chunk(clean_text[i:i+chunk_size], model)
-                yield _make_stream_chunk("", model, finish=True)
-                yield "data: [DONE]\n\n"
-            return StreamingResponse(text_stream(), media_type="text/event-stream")
-        else:
-            return JSONResponse(_make_text_response(clean_text, model))
+    async for chunk in backend.complete(token, messages, tools, thinking, conv_id):
+        if chunk.startswith("data: [DONE]"):
+            break
+        if not chunk.startswith("data: "):
+            continue
+        try:
+            obj    = json.loads(chunk[6:])
+            choice = obj["choices"][0]
+            delta  = choice.get("delta", {})
+            fr     = choice.get("finish_reason")
+            if fr:
+                finish_reason = fr
+            if delta.get("tool_calls"):
+                tc_item      = delta["tool_calls"][0]
+                tool_call_data = tc_item
+                call_id_data   = tc_item.get("id")
+            elif delta.get("content"):
+                full_content += delta["content"]
+        except Exception:
+            continue
+
+    if tool_call_data:
+        return JSONResponse(make_tc_response(
+            {
+                "name":      tool_call_data["function"]["name"],
+                "arguments": tool_call_data["function"]["arguments"],
+            },
+            model,
+        ))
+    return JSONResponse(make_text_response(full_content, model))
 
 
-# ─── Image Generation ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+# Image Generation  (Qwen t2i)
+# ══════════════════════════════════════════════════════════
+
 @app.post("/v1/images/generations", tags=["images"])
 async def image_generations(
-    request: Request,
+    request:       Request,
     authorization: Optional[str] = Header(None),
 ):
     token  = _extract_token(authorization)
@@ -831,21 +959,15 @@ async def image_generations(
         raise HTTPException(status_code=400, detail="'prompt' is required.")
 
     async with httpx.AsyncClient() as client:
-        qwen_chat_id = await _create_chat(token, client)
-        payload = _build_message_payload(
-            qwen_chat_id, prompt,
-            parent_id=None,
-            stream=True,
-            chat_type="t2i",
-            size=size,
-        )
+        cid     = await _qwen_create_chat(token, client)
+        payload = _qwen_build_payload(cid, prompt, None, chat_type="t2i", size=size)
 
         image_url: Optional[str] = None
         async with client.stream(
-            "POST", f"{BASE_QWEN_URL}/chat/completions",
+            "POST", f"{QWEN_BASE}/chat/completions",
             json=payload,
-            headers=_headers_chat(token, stream=True),
-            params={"chat_id": qwen_chat_id},
+            headers=_qwen_headers_chat(token, stream=True),
+            params={"chat_id": cid},
             timeout=300,
         ) as resp:
             async for raw_line in resp.aiter_lines():
@@ -854,7 +976,7 @@ async def image_generations(
                 ds = raw_line[6:].strip()
                 if ds == "[DONE]":
                     break
-                if _is_antibot(raw_line) or _is_rate_limited(raw_line):
+                if _qwen_is_antibot(raw_line) or _qwen_is_rate_limited(raw_line):
                     raise HTTPException(status_code=429, detail="Qwen blocked or rate-limited.")
                 try:
                     obj     = json.loads(ds)
@@ -865,30 +987,37 @@ async def image_generations(
                     continue
 
     if not image_url:
-        raise HTTPException(status_code=500, detail="No image URL returned by Qwen.")
+        raise HTTPException(status_code=500, detail="No image URL returned.")
 
     return JSONResponse({"created": int(time.time()), "data": [{"url": image_url}]})
 
 
-# ─── Image Edits ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════
+# Image Edits  (Qwen t2i + OSS upload)
+# ══════════════════════════════════════════════════════════
+
+OSS_UPLOAD_TIMEOUT = 120
+
+
 def _oss_sig(secret, method, md5, ct, date, canon_hdr, canon_res):
     s2s    = f"{method}\n{md5}\n{ct}\n{date}\n{canon_hdr}{canon_res}"
     digest = hmac.new(secret.encode(), s2s.encode(), hashlib.sha1).digest()
     return base64.b64encode(digest).decode()
 
 
-async def _upload_image(token, image_bytes, client):
+async def _upload_image(token: str, image_bytes: bytes, client: httpx.AsyncClient) -> Dict:
     filename  = f"{uuid.uuid4()}_IMG.jpg"
     file_size = str(len(image_bytes))
 
-    sts_resp = await client.post(
+    sts = await client.post(
         "https://chat.qwen.ai/api/v2/files/getstsToken",
         json={"filename": filename, "filetype": "image", "filesize": file_size},
-        headers=_headers_chat(token), timeout=60,
+        headers=_qwen_headers_chat(token),
+        timeout=60,
     )
-    res = sts_resp.json()
-    if _is_rate_limited(res) or "data" not in res:
-        raise HTTPException(status_code=429, detail="Qwen rate-limited during OSS STS request.")
+    res = sts.json()
+    if _qwen_is_rate_limited(res) or "data" not in res:
+        raise HTTPException(status_code=429, detail="Rate-limited during OSS STS.")
 
     d      = res["data"]
     aki    = d["access_key_id"]
@@ -899,51 +1028,74 @@ async def _upload_image(token, image_bytes, client):
     bucket = d["bucketname"]
     host   = f"{bucket}.{d['endpoint']}"
     furl   = d.get("file_url", f"https://{host}/{fpath}")
-    oss_ua  = "aliyun-sdk-android/2.9.21"
-    c_hdr   = f"x-oss-security-token:{stkn}\n"
+    oss_ua = "aliyun-sdk-android/2.9.21"
+    c_hdr  = f"x-oss-security-token:{stkn}\n"
 
-    def _oh(method, md5, ct, res, extra={}):
+    def _oh(method, md5, ct, res_path, extra=None):
         gmt = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-        sig = _oss_sig(aks, method, md5, ct, gmt, c_hdr, res)
-        h   = {"Authorization": f"OSS {aki}:{sig}", "User-Agent": oss_ua,
-               "Host": host, "x-oss-security-token": stkn, "Date": gmt, "Content-Type": ct}
-        h.update(extra)
+        sig = _oss_sig(aks, method, md5, ct, gmt, c_hdr, res_path)
+        h   = {
+            "Authorization":     f"OSS {aki}:{sig}",
+            "User-Agent":        oss_ua,
+            "Host":              host,
+            "x-oss-security-token": stkn,
+            "Date":              gmt,
+            "Content-Type":      ct,
+        }
+        if extra:
+            h.update(extra)
         return h
 
-    init_r    = await client.post(f"https://{host}/{fpath}?uploads",
-                                  headers=_oh("POST", "", "image/jpeg", f"/{bucket}/{fpath}?uploads", {"Content-Length": "0"}),
-                                  timeout=60)
+    init_r    = await client.post(
+        f"https://{host}/{fpath}?uploads",
+        headers=_oh("POST", "", "image/jpeg", f"/{bucket}/{fpath}?uploads", {"Content-Length": "0"}),
+        timeout=60,
+    )
     upload_id = ET.fromstring(init_r.text).find("{*}UploadId").text
 
     cmd5   = base64.b64encode(hashlib.md5(image_bytes).digest()).decode()
     part_r = await client.put(
         f"https://{host}/{fpath}?uploadId={upload_id}&partNumber=1",
         content=image_bytes,
-        headers=_oh("PUT", cmd5, "image/jpeg", f"/{bucket}/{fpath}?partNumber=1&uploadId={upload_id}",
-                    {"Content-MD5": cmd5, "Content-Length": file_size}),
+        headers=_oh(
+            "PUT", cmd5, "image/jpeg",
+            f"/{bucket}/{fpath}?partNumber=1&uploadId={upload_id}",
+            {"Content-MD5": cmd5, "Content-Length": file_size},
+        ),
         timeout=OSS_UPLOAD_TIMEOUT,
     )
     etag = part_r.headers.get("ETag", "").replace('"', "")
 
-    body = f"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>".encode()
+    body = (
+        f"<CompleteMultipartUpload>"
+        f"<Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>"
+        f"</CompleteMultipartUpload>"
+    ).encode()
     await client.post(
         f"https://{host}/{fpath}?uploadId={upload_id}",
         content=body,
-        headers=_oh("POST", "", "image/jpeg", f"/{bucket}/{fpath}?uploadId={upload_id}",
-                    {"Content-Length": str(len(body))}),
+        headers=_oh(
+            "POST", "", "image/jpeg",
+            f"/{bucket}/{fpath}?uploadId={upload_id}",
+            {"Content-Length": str(len(body))},
+        ),
         timeout=60,
     )
     return {
-        "type": "image",
-        "file": {"data": {}, "filename": filename, "id": fid, "meta": {"name": filename}},
-        "id": fid, "filename": filename, "name": filename,
-        "url": furl, "image_width": 1024, "image_height": 1024,
+        "type":         "image",
+        "file":         {"data": {}, "filename": filename, "id": fid, "meta": {"name": filename}},
+        "id":           fid,
+        "filename":     filename,
+        "name":         filename,
+        "url":          furl,
+        "image_width":  1024,
+        "image_height": 1024,
     }
 
 
 @app.post("/v1/images/edits", tags=["images"])
 async def image_edits(
-    request: Request,
+    request:       Request,
     authorization: Optional[str] = Header(None),
 ):
     token       = _extract_token(authorization)
@@ -971,27 +1123,28 @@ async def image_edits(
         raise HTTPException(status_code=400, detail="'prompt' is required.")
 
     async with httpx.AsyncClient() as client:
-        uploaded   = await _upload_image(token, image_bytes, client)
+        uploaded = await _upload_image(token, image_bytes, client)
         file_entry = {
-            "type": "image", "file": uploaded["file"],
-            "id": uploaded["id"], "url": uploaded["url"],
-            "name": uploaded["filename"],
-            "image_width": 1024, "image_height": 1024,
+            "type":         "image",
+            "file":         uploaded["file"],
+            "id":           uploaded["id"],
+            "url":          uploaded["url"],
+            "name":         uploaded["filename"],
+            "image_width":  1024,
+            "image_height": 1024,
         }
-        qwen_chat_id = await _create_chat(token, client)
-        payload = _build_message_payload(
-            qwen_chat_id, prompt,
-            parent_id=None,
-            stream=True,
+        cid     = await _qwen_create_chat(token, client)
+        payload = _qwen_build_payload(
+            cid, prompt, None,
             chat_type="t2i",
-            uploaded_files=[file_entry],
+            files=[file_entry],
         )
         result_url: Optional[str] = None
         async with client.stream(
-            "POST", f"{BASE_QWEN_URL}/chat/completions",
+            "POST", f"{QWEN_BASE}/chat/completions",
             json=payload,
-            headers=_headers_chat(token, stream=True),
-            params={"chat_id": qwen_chat_id},
+            headers=_qwen_headers_chat(token, stream=True),
+            params={"chat_id": cid},
             timeout=300,
         ) as resp:
             async for raw_line in resp.aiter_lines():
@@ -1000,8 +1153,8 @@ async def image_edits(
                 ds = raw_line[6:].strip()
                 if ds == "[DONE]":
                     break
-                if _is_antibot(raw_line) or _is_rate_limited(raw_line):
-                    raise HTTPException(status_code=429, detail="Qwen blocked or rate-limited.")
+                if _qwen_is_antibot(raw_line) or _qwen_is_rate_limited(raw_line):
+                    raise HTTPException(status_code=429, detail="Qwen blocked.")
                 try:
                     obj     = json.loads(ds)
                     content = obj["choices"][0].get("delta", {}).get("content", "")
@@ -1011,14 +1164,14 @@ async def image_edits(
                     continue
 
     if not result_url:
-        raise HTTPException(status_code=500, detail="No edited image URL returned by Qwen.")
-
+        raise HTTPException(status_code=500, detail="No edited image URL returned.")
     return JSONResponse({"created": int(time.time()), "data": [{"url": result_url}]})
 
 
 # ══════════════════════════════════════════════════════════
-# Error handlers
+# Error Handlers
 # ══════════════════════════════════════════════════════════
+
 @app.exception_handler(HTTPException)
 async def _http_err(request: Request, exc: HTTPException):
     return JSONResponse(
@@ -1037,10 +1190,40 @@ async def _generic_err(request: Request, exc: Exception):
 
 
 # ══════════════════════════════════════════════════════════
-# Entry point
+# Entry Point
 # ══════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Qwen Proxy v4.1 on port %d", port)
+    log.info("Starting Universal AI Proxy v5.0 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+
+
+# ══════════════════════════════════════════════════════════
+# ★ دليل إضافة Backend جديد (للمستقبل)
+# ══════════════════════════════════════════════════════════
+#
+# مثال: إضافة Gemini
+#
+# class GeminiBackend(BaseBackend):
+#     @property
+#     def model_id(self) -> str:
+#         return "gemini"
+#
+#     async def complete(self, token, messages, tools, thinking, conv_id):
+#         # استدعاء Gemini API هنا
+#         # ثم:
+#         tc = parse_tool_call(response_text)
+#         if tc:
+#             yield sse_chunk(tc=tc, model=self.model_id)
+#             yield sse_chunk(tc=tc, model=self.model_id, finish=True)
+#             yield "data: [DONE]\n\n"
+#         else:
+#             yield sse_chunk(clean_text(response_text), model=self.model_id)
+#             yield sse_chunk(model=self.model_id, finish=True)
+#             yield "data: [DONE]\n\n"
+#
+# register_backend(GeminiBackend())
+#
+# ══════════════════════════════════════════════════════════
