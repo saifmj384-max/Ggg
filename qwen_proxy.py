@@ -871,9 +871,14 @@ async def chat_completions(
     )
     if not conv_id:
         key_msgs = messages[:-1] if len(messages) > 1 else messages[:1]
-        conv_id  = hashlib.md5(
+        base_id  = hashlib.md5(
             json.dumps(key_msgs, ensure_ascii=False).encode()
         ).hexdigest()
+        # نُضيف model prefix حتى يعرف backend أي نموذج/scenario يستخدم
+        conv_id = f"{model}:{base_id}"
+    elif model.startswith("kimi") and not conv_id.startswith("kimi"):
+        # conv_id موجود لكن بدون prefix — نضيفه
+        conv_id = f"{model}:{conv_id}"
 
     # FIX ③: deduplication — silent (لا نرجع 429 لأن OpenMinis تعرضه كـ Rate limited)
     req_hash = _request_hash(messages, tools)
@@ -1309,21 +1314,29 @@ def _kimi_encode_message(payload: Dict) -> bytes:
 
 def _kimi_decode_frames(data: bytes) -> List[Dict]:
     """
-    يُفكّك binary stream من Kimi إلى قائمة JSON objects.
-    كل frame = 5-byte header + JSON body.
+    يُفكّك binary stream من Kimi إلى قائمة dicts.
+    Connect protocol frame:
+      byte[0] = flag (0=data, 1=trailer, 2=error)
+      bytes[1:5] = uint32 big-endian length
+      bytes[5:5+length] = JSON body
+
+    يُضيف _error_frame=True للـ error frames حتى يعالجها extract_text.
     """
-    results = []
-    offset  = 0
+    results: List[Dict] = []
+    offset = 0
     while offset + 5 <= len(data):
-        # flag byte (نتجاهله) + uint32 big-endian length
+        flag   = data[offset]
         length = _struct.unpack(">I", data[offset + 1: offset + 5])[0]
-        end    = offset + 5 + length
-        if end > len(data):
+        end_   = offset + 5 + length
+        if end_ > len(data):
             break
-        raw = data[offset + 5: end]
-        offset = end
+        raw    = data[offset + 5: end_]
+        offset = end_
         try:
-            results.append(json.loads(raw.decode("utf-8")))
+            obj = json.loads(raw.decode("utf-8"))
+            if flag == 2:  # error frame
+                obj["_error_frame"] = True
+            results.append(obj)
         except Exception:
             continue
     return results
@@ -1344,24 +1357,15 @@ def _kimi_build_chat_payload(
     """
     يبني payload الـ Chat request لـ Kimi بالبنية الصحيحة.
 
-    البنية الأصلية المستخرجة من كود Kimi:
-      {
-        scenario: str,
-        tools: [],
-        message: {
-          role: "user",
-          blocks: [ {role, content:{type,value:{content}}} ],  ← آخر رسالة
-          scenario: str,
-          is_goal: false
-        },
-        options: {thinking, enablePlugin},
-        project_id: ""
-      }
+    البنية المُستخرجة من كود Kimi الأصلي (дالة р()):
+      block = {"message_id": "", "role": "user"|"assistant",
+               "content": {"text": "نص الرسالة"}}
 
-    يُرسَل system prompt + تاريخ المحادثة كاملاً داخل نص آخر رسالة user
-    (نفس أسلوب Qwen) لأن Kimi لا يدعم history في هذه النقطة.
+    الـ payload الكامل:
+      {scenario, tools:[], message:{role,blocks:[...],scenario,is_goal},
+       options:{thinking,enablePlugin}, project_id:""}
     """
-    # ── جمع كل المحتوى في prompt واحد ───────────────────
+    # ── جمع كل المحتوى في نص واحد ────────────────────────
     parts = []
 
     if system_txt:
@@ -1413,19 +1417,20 @@ def _kimi_build_chat_payload(
     if not full_prompt.strip():
         return {}
 
-    # ── بناء الـ payload بالبنية الصحيحة ─────────────────
+    # ── بناء الـ block بالبنية الصحيحة ───────────────────
+    # content.text = نص مباشر (لا type/value)
+    block = {
+        "message_id": "",
+        "role":       "user",
+        "content":    {"text": full_prompt},
+    }
+
     return {
         "scenario": scenario,
         "tools":    [],
         "message": {
-            "role":    "user",
-            "blocks": [{
-                "role":    "user",
-                "content": {
-                    "type":  "text",
-                    "value": {"content": full_prompt},
-                },
-            }],
+            "role":     "user",
+            "blocks":   [block],
             "scenario": scenario,
             "is_goal":  False,
         },
@@ -1440,13 +1445,13 @@ def _kimi_build_chat_payload(
 def _kimi_extract_text_from_frames(frames: List[Dict]) -> str:
     """
     يجمع النص الكامل من frames Kimi.
-    Kimi يرسل النص في عدة بنى:
-      frame.block.text.content          ← streaming incremental
-      frame.block.content.value.content ← بعض الحالات
-      frame.message.blocks[].text.content ← رسالة كاملة
+    frame.flag:
+      0 = data frame   ← نقرأ منه النص
+      1 = trailer
+      2 = error frame  ← نقرأ الخطأ ونسجّله
     """
     text_parts: List[str] = []
-    seen: set = set()  # لتجنب التكرار
+    seen: set = set()
 
     def _add(t: str) -> None:
         if t and t not in seen:
@@ -1456,18 +1461,34 @@ def _kimi_extract_text_from_frames(frames: List[Dict]) -> str:
     for frame in frames:
         if not isinstance(frame, dict):
             continue
+
+        # error frame (تم تمييزه من _kimi_decode_frames بـ _error_frame=True)
+        if frame.get("_error_frame"):
+            err = frame.get("error", {})
+            code = err.get("code", "")
+            msg  = ""
+            for d in err.get("details", []):
+                dbg = d.get("debug", {})
+                lm  = dbg.get("localizedMessage", {})
+                msg = lm.get("message", "") or d.get("reason", "")
+                if msg:
+                    break
+            log.error("Kimi API error: %s — %s", code, msg)
+            # لا نُضيف الخطأ للنص — نُعيد string فارغ
+            return ""
+
         if "heartbeat" in frame or "notification" in frame:
             continue
         if "done" in frame:
             break
 
-        # ── block مباشر (الشائع في streaming) ──────────
+        # block مباشر
         block = frame.get("block")
         if isinstance(block, dict):
             _kimi_read_block(block, _add)
             continue
 
-        # ── message.blocks (رسالة مكتملة) ───────────────
+        # message.blocks
         msg = frame.get("message")
         if isinstance(msg, dict):
             for blk in msg.get("blocks", []):
@@ -1653,55 +1674,6 @@ class KimiBackend(BaseBackend):
 _kimi_instance = KimiBackend()
 for _kid in ("kimi", "kimi-k2", "kimi-k3", "kimi-auto", "kimi-solve"):
     _BACKENDS[_kid] = _kimi_instance
-
-
-# ══════════════════════════════════════════════════════════
-# Middleware: تمرير model إلى conv_id لـ Kimi
-# ══════════════════════════════════════════════════════════
-# conv_id يُبنى بالشكل "kimi-k3:hashxxx" حتى يعرف KimiBackend
-# أي scenario يستخدم — يعمل بشفافية بدون تعديل الـ routes
-
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as _SR
-from starlette.responses import Response as _SRsp
-
-
-class _ModelConvIdPatcher(BaseHTTPMiddleware):
-    async def dispatch(self, request: _SR, call_next) -> _SRsp:
-        if request.url.path == "/v1/chat/completions":
-            try:
-                raw  = await request.body()
-                body = json.loads(raw)
-                model = body.get("model", "")
-
-                if model.startswith("kimi"):
-                    # نبني conv_id يحمل model prefix
-                    existing = (
-                        body.get("conversation_id")
-                        or body.get("session_id")
-                        or request.headers.get("x-conversation-id")
-                        or request.headers.get("x-session-id")
-                    )
-                    if not existing or not existing.startswith(model + ":"):
-                        msgs     = body.get("messages", [])
-                        key_msgs = msgs[:-1] if len(msgs) > 1 else msgs[:1]
-                        base     = hashlib.md5(
-                            json.dumps(key_msgs, ensure_ascii=False).encode()
-                        ).hexdigest()
-                        body["conversation_id"] = f"{model}:{base}"
-                        raw = json.dumps(body).encode()
-
-                # نُعيد بناء الطلب بالـ body المعدّل
-                async def _recv():
-                    return {"type": "http.request", "body": raw, "more_body": False}
-
-                request = _SR(request.scope, _recv)
-            except Exception:
-                pass
-        return await call_next(request)
-
-
-app.add_middleware(_ModelConvIdPatcher)
 
 
 # ══════════════════════════════════════════════════════════
