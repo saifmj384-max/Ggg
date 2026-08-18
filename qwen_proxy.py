@@ -864,10 +864,18 @@ class DatabaseBackend(BaseBackend):
         log.info("Database: proxy_id=%s real_model=%s msgs=%d (sanitized from %d)",
                  self._proxy_id, real_model, len(clean_messages), len(messages))
 
+        # طباعة الـ payload كاملاً لتشخيص المشكلة
+        log.info("Database RAW INPUT messages: %s",
+                 json.dumps(messages, ensure_ascii=False)[:500])
+        log.info("Database SANITIZED messages: %s",
+                 json.dumps(clean_messages, ensure_ascii=False)[:500])
+
         payload = {
             "messages": clean_messages,
             "model":    real_model,
         }
+
+        log.info("Database PAYLOAD: %s", json.dumps(payload, ensure_ascii=False)[:600])
 
         headers = {
             "Content-Type": "application/json",
