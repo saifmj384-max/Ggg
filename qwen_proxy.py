@@ -1,21 +1,20 @@
 """
-Qwen → OpenAI-Compatible Proxy  v3.0
+Qwen → OpenAI-Compatible Proxy  v4.0
 ======================================
-الميزة الرئيسية: ربط كل محادثة OpenMinis بمحادثة Qwen ثابتة.
-  - أول رسالة في محادثة جديدة  → ينشئ chat_id جديد في Qwen ويحفظه
-  - الرسائل التالية في نفس المحادثة → يُرسل للـ chat_id المحفوظ + parent_id صحيح
-  - المفتاح هو "token:conversation_id" (token لعزل مستخدمين مختلفين)
+إصلاح جذري: دعم كامل لـ Function Calling / Tool Use لأجل OpenMinis
 
-Endpoints:
-  GET  /                       health check
-  GET  /v1/models              قائمة النماذج
-  POST /v1/chat/completions    محادثة نصية  (streaming + non-streaming)
-  POST /v1/images/generations  توليد صورة
-  POST /v1/images/edits        تعديل صورة
+المشاكل التي كانت موجودة في v3:
+  1. كان يتجاهل حقل `tools` من الطلب تماماً
+  2. كان يرسل آخر رسالة فقط لـ Qwen، ويحذف system prompt والتاريخ الكامل
+  3. كان يرد دائماً بـ finish_reason: "stop" — لا يدعم finish_reason: "tool_calls"
+  4. Qwen لا يفهم صيغة tool_calls الأصلية، فيجب محاكاتها نصياً
 
-Deploy on Railway:
-  - PORT يُضخّ تلقائياً من Railway
-  - Authorization: Bearer <QWEN_TOKEN>
+الحل في v4:
+  ─ نحول تعريفات الأدوات إلى نص XML واضح ونضمّه في system prompt
+  ─ نحوّل كامل تاريخ المحادثة (بما فيها tool results) لـ prompt نصي متسلسل
+  ─ نطلب من Qwen الرد بصيغة XML محددة عند استدعاء أداة
+  ─ نحلّل رد Qwen: إذا طلب أداة → نرد بـ tool_calls JSON لـ OpenMinis
+                    إذا أجاب نهائياً → نرد بـ finish_reason: stop
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -45,9 +45,7 @@ QWEN_MODEL_ID      = "qwen3.8-max"
 PROXY_MODEL_ID     = "qwen"
 REQUEST_TIMEOUT    = 180
 OSS_UPLOAD_TIMEOUT = 120
-
-# Session TTL: نحذف الجلسات التي لم تُستخدم أكثر من هذا الوقت (بالثواني)
-SESSION_TTL = 60 * 60 * 6   # 6 ساعات
+SESSION_TTL        = 60 * 60 * 6   # 6 ساعات
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,13 +56,10 @@ log = logging.getLogger("qwen_proxy")
 # ══════════════════════════════════════════════════════════
 # Session Store  (in-memory)
 # ══════════════════════════════════════════════════════════
-# key  → "token_prefix:conv_id"
-# val  → { "qwen_chat_id": str, "parent_id": str|None, "last_used": float }
 _sessions: Dict[str, Dict[str, Any]] = {}
 
 
 def _session_key(token: str, conv_id: str) -> str:
-    # نستخدم أول 16 حرف من التوكن فقط كـ namespace (لا نحفظ التوكن كاملاً)
     return f"{token[:16]}:{conv_id}"
 
 
@@ -93,9 +88,8 @@ def _update_parent(token: str, conv_id: str, parent_id: Optional[str]) -> None:
 
 
 def _evict_old_sessions() -> None:
-    """حذف الجلسات القديمة من الذاكرة."""
-    now    = time.time()
-    stale  = [k for k, v in _sessions.items() if now - v["last_used"] > SESSION_TTL]
+    now   = time.time()
+    stale = [k for k, v in _sessions.items() if now - v["last_used"] > SESSION_TTL]
     for k in stale:
         del _sessions[k]
     if stale:
@@ -107,7 +101,7 @@ def _evict_old_sessions() -> None:
 # ══════════════════════════════════════════════════════════
 app = FastAPI(
     title="Qwen OpenAI-Compatible Proxy",
-    version="3.0.0",
+    version="4.0.0",
     docs_url="/docs",
 )
 
@@ -133,7 +127,6 @@ _UA_NEW = (
 
 
 def _headers_chat(token: str, *, stream: bool = False) -> Dict[str, str]:
-    """Headers لطلبات المحادثة والرسائل."""
     return {
         "User-Agent":      _UA_CHAT,
         "Content-Type":    "application/json; charset=UTF-8",
@@ -154,7 +147,6 @@ def _headers_chat(token: str, *, stream: bool = False) -> Dict[str, str]:
 
 
 def _headers_new(token: str) -> Dict[str, str]:
-    """Headers لإنشاء محادثة جديدة."""
     return {
         "User-Agent":      _UA_NEW,
         "Content-Type":    "application/json",
@@ -200,14 +192,218 @@ def _is_antibot(line: str) -> bool:
 
 
 # ══════════════════════════════════════════════════════════
+# ★★★ الجزء الجديد: تحويل Tools → Prompt نصي ★★★
+# ══════════════════════════════════════════════════════════
+
+TOOL_SYSTEM_SUFFIX = """
+══════════════════════════════════════
+TOOL USE INSTRUCTIONS
+══════════════════════════════════════
+You have access to the tools listed in <available_tools> above.
+
+CRITICAL: When you need to call a tool, you MUST respond ONLY with this exact XML format and NOTHING else — no explanation before or after:
+
+<tool_call>
+<name>TOOL_NAME_HERE</name>
+<arguments>
+{
+  "param1": "value1",
+  "param2": "value2"
+}
+</arguments>
+</tool_call>
+
+When you have enough information to give a FINAL answer (no more tool calls needed), respond normally in plain text WITHOUT any XML tags.
+
+Rules:
+- ONE tool call per response maximum
+- NEVER invent tool results — wait for the system to provide them
+- After receiving tool results, either call another tool OR give your final answer
+- Tool results will appear in the conversation as [TOOL RESULT: tool_name] ... [/TOOL RESULT]
+══════════════════════════════════════
+"""
+
+
+def _tools_to_xml(tools: List[Dict]) -> str:
+    """تحويل تعريفات الأدوات بصيغة OpenAI إلى نص XML مقروء."""
+    if not tools:
+        return ""
+    lines = ["<available_tools>"]
+    for tool in tools:
+        # صيغة OpenAI: {"type": "function", "function": {...}}
+        func = tool.get("function") or tool
+        name = func.get("name", "unknown")
+        desc = func.get("description", "")
+        params = func.get("parameters", {})
+        required = params.get("required", [])
+        properties = params.get("properties", {})
+
+        lines.append(f"  <tool>")
+        lines.append(f"    <name>{name}</name>")
+        lines.append(f"    <description>{desc}</description>")
+        if properties:
+            lines.append(f"    <parameters>")
+            for pname, pinfo in properties.items():
+                ptype = pinfo.get("type", "string")
+                pdesc = pinfo.get("description", "")
+                req   = " (required)" if pname in required else " (optional)"
+                lines.append(f"      <param name=\"{pname}\" type=\"{ptype}\"{req}>{pdesc}</param>")
+            lines.append(f"    </parameters>")
+        lines.append(f"  </tool>")
+    lines.append("</available_tools>")
+    return "\n".join(lines)
+
+
+def _messages_to_full_prompt(messages: List[Dict], tools: List[Dict]) -> Tuple[str, str]:
+    """
+    تحويل كامل قائمة الرسائل إلى:
+    - system_text: النص الكامل للـ system prompt
+    - conversation_text: نص المحادثة كاملاً
+
+    يدعم رسائل: system, user, assistant, tool
+    """
+    system_parts = []
+    conversation_parts = []
+
+    # أولاً نجمع كل system messages
+    for m in messages:
+        if m.get("role") == "system":
+            content = m.get("content") or ""
+            if isinstance(content, list):
+                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+            system_parts.append(str(content))
+
+    # إذا كان فيه أدوات، نضيف تعريفها وتعليمات الاستخدام
+    if tools:
+        system_parts.append(f"\n{_tools_to_xml(tools)}\n{TOOL_SYSTEM_SUFFIX}")
+
+    # ثانياً نحول باقي الرسائل إلى نص محادثة
+    for m in messages:
+        role    = m.get("role", "user")
+        content = m.get("content") or ""
+
+        if role == "system":
+            # تم معالجتها بالفعل
+            continue
+
+        elif role == "user":
+            if isinstance(content, list):
+                # قد يحتوي على نصوص وصور
+                text_parts = []
+                for c in content:
+                    if isinstance(c, dict):
+                        if c.get("type") == "text":
+                            text_parts.append(c.get("text", ""))
+                        elif c.get("type") == "image_url":
+                            text_parts.append("[IMAGE]")
+                content = " ".join(text_parts)
+            conversation_parts.append(f"User: {content}")
+
+        elif role == "assistant":
+            if isinstance(content, list):
+                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
+
+            # إذا كانت الرسالة تحتوي على tool_calls من دورة سابقة
+            tool_calls = m.get("tool_calls", [])
+            if tool_calls:
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    tc_name = func.get("name", "")
+                    tc_args = func.get("arguments", "{}")
+                    conversation_parts.append(
+                        f"Assistant: <tool_call><name>{tc_name}</name><arguments>{tc_args}</arguments></tool_call>"
+                    )
+            else:
+                conversation_parts.append(f"Assistant: {content}")
+
+        elif role == "tool":
+            # نتيجة تنفيذ أداة من OpenMinis
+            tool_call_id = m.get("tool_call_id", "")
+            tool_name    = m.get("name", tool_call_id)
+            if isinstance(content, list):
+                content = " ".join(c.get("text", "") for c in content if isinstance(c, dict))
+            conversation_parts.append(
+                f"[TOOL RESULT: {tool_name}]\n{content}\n[/TOOL RESULT]"
+            )
+
+        elif role == "function":
+            # صيغة قديمة
+            func_name = m.get("name", "function")
+            if isinstance(content, list):
+                content = str(content)
+            conversation_parts.append(
+                f"[TOOL RESULT: {func_name}]\n{content}\n[/TOOL RESULT]"
+            )
+
+    system_text       = "\n\n".join(system_parts)
+    conversation_text = "\n\n".join(conversation_parts)
+    return system_text, conversation_text
+
+
+def _build_full_prompt(messages: List[Dict], tools: List[Dict]) -> str:
+    """
+    بناء البرومبت الكامل الذي يُرسل لـ Qwen
+    """
+    system_text, conversation_text = _messages_to_full_prompt(messages, tools)
+
+    parts = []
+    if system_text:
+        parts.append(f"[SYSTEM]\n{system_text}\n[/SYSTEM]")
+    if conversation_text:
+        parts.append(conversation_text)
+    parts.append("Assistant:")  # نطلب من Qwen الرد
+
+    return "\n\n".join(parts)
+
+
+# ══════════════════════════════════════════════════════════
+# ★★★ تحليل رد Qwen: هل هو tool_call أم إجابة نهائية؟ ★★★
+# ══════════════════════════════════════════════════════════
+
+# نمط XML للأداة
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _parse_tool_call(text: str) -> Optional[Dict]:
+    """
+    إذا كان النص يحتوي على tool_call XML، استخرجه.
+    يُعيد dict مع name وarguments، أو None إذا لم يكن tool call.
+    """
+    m = _TOOL_CALL_RE.search(text)
+    if not m:
+        return None
+
+    name = m.group(1).strip()
+    args_str = m.group(2).strip()
+
+    # تحقق أن الـ arguments صالح JSON
+    try:
+        args_obj = json.loads(args_str)
+    except json.JSONDecodeError:
+        # حاول إصلاحه
+        try:
+            args_obj = json.loads(args_str.replace("'", '"'))
+        except Exception:
+            args_obj = {}
+
+    return {
+        "name": name,
+        "arguments": json.dumps(args_obj, ensure_ascii=False),
+    }
+
+
+# ══════════════════════════════════════════════════════════
 # Qwen Chat API
 # ══════════════════════════════════════════════════════════
+
 async def _create_chat(token: str, client: httpx.AsyncClient) -> str:
     url     = f"{BASE_QWEN_URL}/chats/new"
     payload = {"chat_mode": "normal", "project_id": ""}
     resp    = await client.post(url, json=payload, headers=_headers_new(token), timeout=60)
     data    = resp.json()
-    # Qwen يُعيد chat_id في أماكن مختلفة حسب الإصدار
     cid = (
         data.get("chat_id")
         or data.get("id")
@@ -218,35 +414,6 @@ async def _create_chat(token: str, client: httpx.AsyncClient) -> str:
         raise HTTPException(status_code=502, detail=f"Failed to create Qwen chat: {data}")
     log.info("Created qwen chat_id=%s", cid)
     return cid
-
-
-def _extract_last_message_content(messages: List[Dict[str, Any]]) -> str:
-    """استخرج آخر رسالة user فقط (بدون تاريخ المحادثة — Qwen يحتفظ بالتاريخ بنفسه)."""
-    # نبحث من الآخر عن آخر رسالة user
-    for m in reversed(messages):
-        if m.get("role") in ("user", "human"):
-            content = m.get("content") or ""
-            if isinstance(content, list):
-                # vision content
-                text_parts = [
-                    c.get("text", "")
-                    for c in content
-                    if isinstance(c, dict) and c.get("type") == "text"
-                ]
-                return " ".join(text_parts).strip()
-            return str(content).strip()
-    # لم نجد user message → نجمع كل شيء
-    parts = []
-    for m in messages:
-        role    = m.get("role", "user")
-        content = m.get("content") or ""
-        if isinstance(content, list):
-            content = " ".join(c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text")
-        if role == "system":
-            parts.insert(0, f"[System]: {content}")
-        else:
-            parts.append(str(content))
-    return "\n".join(parts).strip()
 
 
 def _build_message_payload(
@@ -261,7 +428,6 @@ def _build_message_payload(
     auto_search: bool = False,
     size: str = "1:1",
 ) -> Dict[str, Any]:
-    """بناء الـ payload الكامل بما فيها parent_id لربط سلسلة الرسائل."""
     ts  = int(time.time())
     fid = str(uuid.uuid4())
 
@@ -282,17 +448,14 @@ def _build_message_payload(
         "sub_chat_type": chat_type,
         "models":        [QWEN_MODEL_ID],
         "model":         "",
-        "files":         [],
+        "files":         uploaded_files or [],
         "user_action":   "chat",
         "extra":         {"meta": {"subChatType": chat_type}},
         "parentId":      parent_id,
         "parent_id":     parent_id,
     }
 
-    if uploaded_files:
-        msg["files"] = uploaded_files
-
-    payload: Dict[str, Any] = {
+    return {
         "stream":                   stream,
         "incremental_output":       True,
         "chatId":                   chat_id,
@@ -309,40 +472,11 @@ def _build_message_payload(
         "parent_id":                parent_id,
     }
 
-    return payload
-
-
-# ══════════════════════════════════════════════════════════
-# SSE parsing + response_id استخراج
-# ══════════════════════════════════════════════════════════
-def _make_chunk(content: str, model: str, *, finish: bool = False) -> str:
-    return f"data: {json.dumps({'id': f'chatcmpl-{uuid.uuid4().hex}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'content': content} if content else {}, 'finish_reason': 'stop' if finish else None}]})}\n\n"
-
-
-def _make_full_response(content: str, model: str) -> Dict:
-    return {
-        "id":      f"chatcmpl-{uuid.uuid4().hex}",
-        "object":  "chat.completion",
-        "created": int(time.time()),
-        "model":   model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-        "usage":   {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
-
 
 def _extract_response_id(obj: Dict) -> Optional[str]:
-    """استخرج response_id من رد Qwen لاستخدامه كـ parent_id للرسالة التالية."""
-    # الشكل الأكثر شيوعاً
     rid = obj.get("response_id")
     if rid:
         return rid
-    # nested
-    created = obj.get("response.created")
-    if isinstance(created, dict):
-        rid = created.get("response_id")
-        if rid:
-            return rid
-    # في بعض الإصدارات يكون داخل choices
     choices = obj.get("choices", [])
     if choices and isinstance(choices[0], dict):
         delta = choices[0].get("delta", {})
@@ -352,158 +486,158 @@ def _extract_response_id(obj: Dict) -> Optional[str]:
     return None
 
 
-async def _stream_and_collect(
+# ══════════════════════════════════════════════════════════
+# SSE Stream من Qwen + جمع الرد الكامل
+# ══════════════════════════════════════════════════════════
+
+async def _stream_from_qwen_collect_all(
     token: str,
     chat_id: str,
     payload: Dict,
-    model_name: str,
     client: httpx.AsyncClient,
-) -> AsyncIterator[Tuple[str, Optional[str]]]:
+) -> Tuple[str, Optional[str]]:
     """
-    Yield (sse_chunk, response_id|None).
-    response_id يكون غير None فقط في آخر chunk يحمله.
+    يقرأ الـ stream من Qwen ويجمع الرد الكامل كنص.
+    يُعيد (full_text, response_id).
     """
-    url         = f"{BASE_QWEN_URL}/chat/completions"
-    headers     = _headers_chat(token, stream=True)
-    response_id: Optional[str] = None
+    url      = f"{BASE_QWEN_URL}/chat/completions"
+    headers  = _headers_chat(token, stream=True)
+    full_txt = ""
+    resp_id: Optional[str] = None
 
-    try:
-        async with client.stream(
-            "POST", url,
-            json=payload,
-            headers=headers,
-            params={"chat_id": chat_id},
-            timeout=REQUEST_TIMEOUT,
-        ) as resp:
-            async for raw_line in resp.aiter_lines():
-                if not raw_line:
-                    continue
-                if _is_antibot(raw_line):
-                    yield _make_chunk("[BLOCKED: Qwen anti-bot triggered]", model_name), None
+    async with client.stream(
+        "POST", url,
+        json=payload,
+        headers=headers,
+        params={"chat_id": chat_id},
+        timeout=REQUEST_TIMEOUT,
+    ) as resp:
+        async for raw_line in resp.aiter_lines():
+            if not raw_line:
+                continue
+            if _is_antibot(raw_line):
+                full_txt += "[BLOCKED: Qwen anti-bot triggered]"
+                break
+            if _is_rate_limited(raw_line):
+                full_txt += "[ERROR: Rate limited]"
+                break
+            if not raw_line.startswith("data: "):
+                continue
+            data_str = raw_line[6:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                obj = json.loads(data_str)
+                if _is_rate_limited(obj):
+                    full_txt += "[ERROR: Rate limited]"
                     break
-                if _is_rate_limited(raw_line):
-                    yield _make_chunk("[ERROR: Rate limited]", model_name), None
-                    break
-                if not raw_line.startswith("data: "):
+
+                rid = _extract_response_id(obj)
+                if rid:
+                    resp_id = rid
+
+                choices = obj.get("choices", [])
+                if not choices:
                     continue
-                data_str = raw_line[6:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    obj = json.loads(data_str)
-                    if _is_rate_limited(obj):
-                        yield _make_chunk("[ERROR: Rate limited]", model_name), None
-                        break
-
-                    # محاولة استخراج response_id
-                    rid = _extract_response_id(obj)
-                    if rid:
-                        response_id = rid
-
-                    choices = obj.get("choices", [])
-                    if not choices:
-                        continue
-                    delta = choices[0].get("delta", {})
-
-                    # تجاهل مراحل التفكير والبحث
-                    phase = delta.get("phase", "")
-                    if phase and phase not in ("answer", ""):
-                        continue
-
-                    content = delta.get("content", "")
-                    if content:
-                        yield _make_chunk(content, model_name), None
-                except (json.JSONDecodeError, KeyError):
+                delta = choices[0].get("delta", {})
+                phase = delta.get("phase", "")
+                if phase and phase not in ("answer", ""):
                     continue
+                content = delta.get("content", "")
+                if content:
+                    full_txt += content
+            except (json.JSONDecodeError, KeyError):
+                continue
 
-    except Exception as exc:
-        log.error("Stream error: %s", exc)
-        yield _make_chunk(f"[ERROR: {exc}]", model_name), None
-
-    yield _make_chunk("", model_name, finish=True), response_id
-    yield "data: [DONE]\n\n", None
+    return full_txt, resp_id
 
 
 # ══════════════════════════════════════════════════════════
-# OSS Image Upload
+# بناء ردود OpenAI-compatible
 # ══════════════════════════════════════════════════════════
-def _oss_sig(secret: str, method: str, md5: str, ct: str,
-             date: str, canon_hdr: str, canon_res: str) -> str:
-    s2s    = f"{method}\n{md5}\n{ct}\n{date}\n{canon_hdr}{canon_res}"
-    digest = hmac.new(secret.encode(), s2s.encode(), hashlib.sha1).digest()
-    return base64.b64encode(digest).decode()
 
-
-async def _upload_image(token: str, image_bytes: bytes,
-                        client: httpx.AsyncClient) -> Dict:
-    filename  = f"{uuid.uuid4()}_IMG.jpg"
-    file_size = str(len(image_bytes))
-
-    sts_resp = await client.post(
-        "https://chat.qwen.ai/api/v2/files/getstsToken",
-        json={"filename": filename, "filetype": "image", "filesize": file_size},
-        headers=_headers_chat(token),
-        timeout=60,
-    )
-    res = sts_resp.json()
-    if _is_rate_limited(res) or "data" not in res:
-        raise HTTPException(status_code=429, detail="Qwen rate-limited during OSS STS request.")
-
-    d      = res["data"]
-    aki    = d["access_key_id"]
-    aks    = d["access_key_secret"]
-    stkn   = d["security_token"]
-    fpath  = d["file_path"]
-    fid    = d["file_id"]
-    bucket = d["bucketname"]
-    host   = f"{bucket}.{d['endpoint']}"
-    furl   = d.get("file_url", f"https://{host}/{fpath}")
-
-    oss_ua  = "aliyun-sdk-android/2.9.21"
-    c_hdr   = f"x-oss-security-token:{stkn}\n"
-
-    def _oh(method: str, md5: str, ct: str, res: str, extra: Dict = {}) -> Dict:
-        gmt = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-        sig = _oss_sig(aks, method, md5, ct, gmt, c_hdr, res)
-        h   = {"Authorization": f"OSS {aki}:{sig}", "User-Agent": oss_ua,
-               "Host": host, "x-oss-security-token": stkn, "Date": gmt, "Content-Type": ct}
-        h.update(extra)
-        return h
-
-    # Initiate
-    init_r = await client.post(f"https://{host}/{fpath}?uploads",
-                               headers=_oh("POST", "", "image/jpeg", f"/{bucket}/{fpath}?uploads", {"Content-Length": "0"}),
-                               timeout=60)
-    upload_id = ET.fromstring(init_r.text).find("{*}UploadId").text
-
-    # Upload part
-    cmd5      = base64.b64encode(hashlib.md5(image_bytes).digest()).decode()
-    part_r    = await client.put(
-        f"https://{host}/{fpath}?uploadId={upload_id}&partNumber=1",
-        content=image_bytes,
-        headers=_oh("PUT", cmd5, "image/jpeg", f"/{bucket}/{fpath}?partNumber=1&uploadId={upload_id}",
-                    {"Content-MD5": cmd5, "Content-Length": file_size}),
-        timeout=OSS_UPLOAD_TIMEOUT,
-    )
-    etag = part_r.headers.get("ETag", "").replace('"', "")
-
-    # Complete
-    body = f"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>".encode()
-    await client.post(
-        f"https://{host}/{fpath}?uploadId={upload_id}",
-        content=body,
-        headers=_oh("POST", "", "image/jpeg", f"/{bucket}/{fpath}?uploadId={upload_id}",
-                    {"Content-Length": str(len(body))}),
-        timeout=60,
-    )
-
-    log.info("Uploaded image file_id=%s", fid)
+def _make_tool_call_response(tool_call: Dict, model: str) -> Dict:
+    """رد بصيغة OpenAI عند استدعاء أداة."""
+    call_id = f"call_{uuid.uuid4().hex[:24]}"
     return {
-        "type": "image",
-        "file": {"data": {}, "filename": filename, "id": fid, "meta": {"name": filename}},
-        "id": fid, "filename": filename, "name": filename,
-        "url": furl, "image_width": 1024, "image_height": 1024,
+        "id":      f"chatcmpl-{uuid.uuid4().hex}",
+        "object":  "chat.completion",
+        "created": int(time.time()),
+        "model":   model,
+        "choices": [{
+            "index":   0,
+            "message": {
+                "role":    "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id":       call_id,
+                    "type":     "function",
+                    "function": {
+                        "name":      tool_call["name"],
+                        "arguments": tool_call["arguments"],
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls",  # ← هذا المهم!
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
+
+
+def _make_text_response(content: str, model: str) -> Dict:
+    """رد بصيغة OpenAI عند الإجابة النهائية."""
+    return {
+        "id":      f"chatcmpl-{uuid.uuid4().hex}",
+        "object":  "chat.completion",
+        "created": int(time.time()),
+        "model":   model,
+        "choices": [{
+            "index":   0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+def _make_stream_chunk(content: str, model: str, *,
+                       finish: bool = False,
+                       tool_call: Optional[Dict] = None,
+                       tool_call_index: int = 0) -> str:
+    """SSE chunk لـ streaming mode."""
+    chunk_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+    if tool_call and not content:
+        # Streaming tool_calls: نرسل في عدة chunks كما تفعل OpenAI
+        # chunk 1: tool_calls delta (function name + start of arguments)
+        delta = {
+            "tool_calls": [{
+                "index": tool_call_index,
+                "id":    f"call_{uuid.uuid4().hex[:24]}",
+                "type":  "function",
+                "function": {
+                    "name":      tool_call["name"],
+                    "arguments": tool_call["arguments"],
+                }
+            }]
+        }
+        choice = {"index": 0, "delta": delta, "finish_reason": None}
+    elif finish and tool_call:
+        # الـ chunk الأخير عند tool_call
+        choice = {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+    elif finish:
+        choice = {"index": 0, "delta": {}, "finish_reason": "stop"}
+    else:
+        choice = {"index": 0, "delta": {"content": content}, "finish_reason": None}
+
+    obj = {
+        "id":      chunk_id,
+        "object":  "chat.completion.chunk",
+        "created": int(time.time()),
+        "model":   model,
+        "choices": [choice],
+    }
+    return f"data: {json.dumps(obj)}\n\n"
 
 
 # ══════════════════════════════════════════════════════════
@@ -514,10 +648,11 @@ async def _upload_image(token: str, image_bytes: bytes,
 async def health():
     _evict_old_sessions()
     return {
-        "status":       "ok",
-        "proxy":        "Qwen OpenAI-Compatible Proxy",
-        "version":      "3.0.0",
+        "status":          "ok",
+        "proxy":           "Qwen OpenAI-Compatible Proxy",
+        "version":         "4.0.0",
         "active_sessions": len(_sessions),
+        "features":        ["tool_calls", "system_prompt", "full_history", "streaming"],
     }
 
 
@@ -526,8 +661,8 @@ async def list_models():
     return {
         "object": "list",
         "data": [
-            {"id": PROXY_MODEL_ID,  "object": "model", "created": 1700000000, "owned_by": "qwen"},
-            {"id": "qwen-vision",   "object": "model", "created": 1700000000, "owned_by": "qwen"},
+            {"id": PROXY_MODEL_ID, "object": "model", "created": 1700000000, "owned_by": "qwen"},
+            {"id": "qwen-vision",  "object": "model", "created": 1700000000, "owned_by": "qwen"},
         ],
     }
 
@@ -538,43 +673,47 @@ async def chat_completions(
     request: Request,
     authorization: Optional[str] = Header(None),
 ):
-    token    = _extract_token(authorization)
-    body     = await request.json()
-    messages = body.get("messages", [])
+    token     = _extract_token(authorization)
+    body      = await request.json()
+    messages  = body.get("messages", [])
+    tools     = body.get("tools", [])         # ★ جديد: نقرأ الأدوات
     do_stream = body.get("stream", False)
-    model    = body.get("model", PROXY_MODEL_ID)
+    model     = body.get("model", PROXY_MODEL_ID)
     thinking    = bool(body.get("thinking", False))
     auto_search = bool(body.get("auto_search", False))
 
-    # ── معرّف المحادثة من OpenMinis ──────────────────────
-    # OpenMinis يُرسل conversation_id في أحد هذه الأماكن:
+    # ── معرّف المحادثة ──────────────────────────────────
     conv_id = (
         body.get("conversation_id")
         or body.get("session_id")
         or request.headers.get("x-conversation-id")
         or request.headers.get("x-session-id")
     )
-    # إذا لم يُرسل conv_id → ننشئ واحداً من hash آخر رسالة
-    # (هذا يضمن أن نفس المحادثة لا تُنشئ chat_ids متعددة)
     if not conv_id:
-        conv_id = hashlib.md5(
-            json.dumps(messages[:-1], ensure_ascii=False).encode()
-        ).hexdigest() if len(messages) > 1 else str(uuid.uuid4())
+        # اصنع معرّفاً ثابتاً من أول رسائل المحادثة (استثناء آخر رسالة)
+        key_msgs = messages[:-1] if len(messages) > 1 else messages[:1]
+        conv_id  = hashlib.md5(
+            json.dumps(key_msgs, ensure_ascii=False).encode()
+        ).hexdigest()
 
-    # استخرج آخر رسالة user فقط (Qwen يحتفظ بالتاريخ)
-    prompt = _extract_last_message_content(messages)
-    if not prompt:
-        raise HTTPException(status_code=400, detail="No user message found.")
+    log.info("conv_id=%s | messages=%d | tools=%d | stream=%s",
+             conv_id, len(messages), len(tools), do_stream)
+
+    # ★ بناء البرومبت الكامل (system + كل التاريخ + تعريفات الأدوات)
+    full_prompt = _build_full_prompt(messages, tools)
+    log.debug("Full prompt length: %d chars", len(full_prompt))
+
+    if not full_prompt.strip():
+        raise HTTPException(status_code=400, detail="No messages found.")
 
     _evict_old_sessions()
 
-    # ── تحديد qwen_chat_id (client مؤقت فقط لإنشاء chat جديد إن لزم) ──
+    # ── تحديد/إنشاء qwen_chat_id ──────────────────────
     sess = _get_session(token, conv_id)
     if sess:
         qwen_chat_id = sess["qwen_chat_id"]
         parent_id    = sess["parent_id"]
-        log.info("Reusing qwen_chat_id=%s for conv_id=%s (parent=%s)",
-                 qwen_chat_id, conv_id, parent_id)
+        log.info("Reusing qwen_chat_id=%s (parent=%s)", qwen_chat_id, parent_id)
     else:
         async with httpx.AsyncClient() as tmp:
             qwen_chat_id = await _create_chat(token, tmp)
@@ -583,7 +722,7 @@ async def chat_completions(
         log.info("New session: conv_id=%s → qwen_chat_id=%s", conv_id, qwen_chat_id)
 
     payload = _build_message_payload(
-        qwen_chat_id, prompt,
+        qwen_chat_id, full_prompt,
         parent_id=parent_id,
         stream=True,
         chat_type="t2t",
@@ -591,41 +730,47 @@ async def chat_completions(
         auto_search=auto_search,
     )
 
-    if do_stream:
-        # ✅ client يُنشأ داخل generator ويبقى حياً طوال الـ stream
-        async def event_stream():
-            last_rid: Optional[str] = None
-            async with httpx.AsyncClient() as stream_client:
-                async for chunk, rid in _stream_and_collect(
-                    token, qwen_chat_id, payload, model, stream_client
-                ):
-                    yield chunk
-                    if rid:
-                        last_rid = rid
-            _update_parent(token, conv_id, last_rid)
-            log.info("Updated parent_id=%s for conv_id=%s", last_rid, conv_id)
-
-        return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-    # ── Non-streaming ──
-    full_content = ""
-    last_rid: Optional[str] = None
+    # ── جمع الرد الكامل من Qwen أولاً (نحتاج التحليل قبل الرد) ──
     async with httpx.AsyncClient() as client:
-        async for chunk, rid in _stream_and_collect(
-            token, qwen_chat_id, payload, model, client
-        ):
-            if rid:
-                last_rid = rid
-            if chunk.startswith("data: {"):
-                try:
-                    obj = json.loads(chunk[6:])
-                    c   = obj["choices"][0]["delta"].get("content", "")
-                    full_content += c
-                except Exception:
-                    pass
+        qwen_text, last_rid = await _stream_from_qwen_collect_all(
+            token, qwen_chat_id, payload, client
+        )
 
     _update_parent(token, conv_id, last_rid)
-    return JSONResponse(_make_full_response(full_content, model))
+    log.info("Qwen response length: %d chars | parent_id=%s", len(qwen_text), last_rid)
+
+    # ★ التحليل: هل طلب Qwen أداة؟
+    parsed_tool = _parse_tool_call(qwen_text)
+
+    if parsed_tool:
+        log.info("Tool call detected: %s", parsed_tool["name"])
+
+        if do_stream:
+            # streaming مع tool_calls
+            async def tool_stream():
+                yield _make_stream_chunk("", model, tool_call=parsed_tool)
+                yield _make_stream_chunk("", model, finish=True, tool_call=parsed_tool)
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(tool_stream(), media_type="text/event-stream")
+        else:
+            return JSONResponse(_make_tool_call_response(parsed_tool, model))
+
+    else:
+        # إجابة نصية عادية
+        # نزيل أي XML artifact عشوائي قد يكون تسرّب
+        clean_text = _TOOL_CALL_RE.sub("", qwen_text).strip()
+
+        if do_stream:
+            async def text_stream():
+                # نرسل النص على شكل chunks صغيرة
+                chunk_size = 20
+                for i in range(0, len(clean_text), chunk_size):
+                    yield _make_stream_chunk(clean_text[i:i+chunk_size], model)
+                yield _make_stream_chunk("", model, finish=True)
+                yield "data: [DONE]\n\n"
+            return StreamingResponse(text_stream(), media_type="text/event-stream")
+        else:
+            return JSONResponse(_make_text_response(clean_text, model))
 
 
 # ─── Image Generation ─────────────────────────────────────
@@ -683,14 +828,84 @@ async def image_generations(
 
 
 # ─── Image Edits ──────────────────────────────────────────
+def _oss_sig(secret, method, md5, ct, date, canon_hdr, canon_res):
+    s2s    = f"{method}\n{md5}\n{ct}\n{date}\n{canon_hdr}{canon_res}"
+    digest = hmac.new(secret.encode(), s2s.encode(), hashlib.sha1).digest()
+    return base64.b64encode(digest).decode()
+
+
+async def _upload_image(token, image_bytes, client):
+    filename  = f"{uuid.uuid4()}_IMG.jpg"
+    file_size = str(len(image_bytes))
+
+    sts_resp = await client.post(
+        "https://chat.qwen.ai/api/v2/files/getstsToken",
+        json={"filename": filename, "filetype": "image", "filesize": file_size},
+        headers=_headers_chat(token), timeout=60,
+    )
+    res = sts_resp.json()
+    if _is_rate_limited(res) or "data" not in res:
+        raise HTTPException(status_code=429, detail="Qwen rate-limited during OSS STS request.")
+
+    d      = res["data"]
+    aki    = d["access_key_id"]
+    aks    = d["access_key_secret"]
+    stkn   = d["security_token"]
+    fpath  = d["file_path"]
+    fid    = d["file_id"]
+    bucket = d["bucketname"]
+    host   = f"{bucket}.{d['endpoint']}"
+    furl   = d.get("file_url", f"https://{host}/{fpath}")
+    oss_ua  = "aliyun-sdk-android/2.9.21"
+    c_hdr   = f"x-oss-security-token:{stkn}\n"
+
+    def _oh(method, md5, ct, res, extra={}):
+        gmt = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        sig = _oss_sig(aks, method, md5, ct, gmt, c_hdr, res)
+        h   = {"Authorization": f"OSS {aki}:{sig}", "User-Agent": oss_ua,
+               "Host": host, "x-oss-security-token": stkn, "Date": gmt, "Content-Type": ct}
+        h.update(extra)
+        return h
+
+    init_r    = await client.post(f"https://{host}/{fpath}?uploads",
+                                  headers=_oh("POST", "", "image/jpeg", f"/{bucket}/{fpath}?uploads", {"Content-Length": "0"}),
+                                  timeout=60)
+    upload_id = ET.fromstring(init_r.text).find("{*}UploadId").text
+
+    cmd5   = base64.b64encode(hashlib.md5(image_bytes).digest()).decode()
+    part_r = await client.put(
+        f"https://{host}/{fpath}?uploadId={upload_id}&partNumber=1",
+        content=image_bytes,
+        headers=_oh("PUT", cmd5, "image/jpeg", f"/{bucket}/{fpath}?partNumber=1&uploadId={upload_id}",
+                    {"Content-MD5": cmd5, "Content-Length": file_size}),
+        timeout=OSS_UPLOAD_TIMEOUT,
+    )
+    etag = part_r.headers.get("ETag", "").replace('"', "")
+
+    body = f"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>".encode()
+    await client.post(
+        f"https://{host}/{fpath}?uploadId={upload_id}",
+        content=body,
+        headers=_oh("POST", "", "image/jpeg", f"/{bucket}/{fpath}?uploadId={upload_id}",
+                    {"Content-Length": str(len(body))}),
+        timeout=60,
+    )
+    return {
+        "type": "image",
+        "file": {"data": {}, "filename": filename, "id": fid, "meta": {"name": filename}},
+        "id": fid, "filename": filename, "name": filename,
+        "url": furl, "image_width": 1024, "image_height": 1024,
+    }
+
+
 @app.post("/v1/images/edits", tags=["images"])
 async def image_edits(
     request: Request,
     authorization: Optional[str] = Header(None),
 ):
-    token        = _extract_token(authorization)
-    image_bytes: Optional[bytes] = None
-    prompt       = ""
+    token       = _extract_token(authorization)
+    image_bytes = None
+    prompt      = ""
 
     if "multipart/form-data" in request.headers.get("content-type", ""):
         form      = await request.form()
@@ -713,14 +928,13 @@ async def image_edits(
         raise HTTPException(status_code=400, detail="'prompt' is required.")
 
     async with httpx.AsyncClient() as client:
-        uploaded = await _upload_image(token, image_bytes, client)
+        uploaded   = await _upload_image(token, image_bytes, client)
         file_entry = {
             "type": "image", "file": uploaded["file"],
             "id": uploaded["id"], "url": uploaded["url"],
             "name": uploaded["filename"],
             "image_width": 1024, "image_height": 1024,
         }
-
         qwen_chat_id = await _create_chat(token, client)
         payload = _build_message_payload(
             qwen_chat_id, prompt,
@@ -729,7 +943,6 @@ async def image_edits(
             chat_type="t2i",
             uploaded_files=[file_entry],
         )
-
         result_url: Optional[str] = None
         async with client.stream(
             "POST", f"{BASE_QWEN_URL}/chat/completions",
@@ -770,6 +983,7 @@ async def _http_err(request: Request, exc: HTTPException):
         content={"error": {"message": exc.detail, "type": "proxy_error", "code": exc.status_code}},
     )
 
+
 @app.exception_handler(Exception)
 async def _generic_err(request: Request, exc: Exception):
     log.error("Unhandled: %s", exc, exc_info=True)
@@ -785,5 +999,5 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Qwen Proxy v3.0 on port %d", port)
+    log.info("Starting Qwen Proxy v4.0 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
