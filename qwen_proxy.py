@@ -781,69 +781,91 @@ def _db_is_database_token(token: str) -> bool:
     return token.strip() == DATABASE_FIXED_TOKEN
 
 
+def _content_to_str(content) -> str:
+    """تحويل content من أي صيغة إلى نص"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for c in content:
+            if isinstance(c, dict):
+                if c.get("type") == "text":
+                    parts.append(c.get("text", ""))
+                elif c.get("type") == "image_url":
+                    parts.append("[IMAGE]")
+            elif isinstance(c, str):
+                parts.append(c)
+        return " ".join(parts).strip()
+    return str(content) if content else ""
+
+
 def _db_sanitize_messages(messages: List[Dict]) -> List[Dict]:
     """
-    تنظيف الرسائل قبل إرسالها للـ Supabase:
-    - الاحتفاظ بـ role و content فقط
-    - تحويل content من list إلى string
-    - دمج system messages في أول رسالة user
+    تنظيف الرسائل قبل إرسالها للـ Supabase.
+    الـ Supabase يقبل فقط: [{"role": "user"|"assistant", "content": "..."}]
+    ويشترط التناوب user/assistant ويبدأ بـ user.
     """
-    # استخراج system messages أولاً
-    system_texts = []
-    clean = []
+    # الخطوة 1: استخراج system prompt وتحويل كل شيء إلى نص
+    system_parts = []
+    turns = []  # [(role, content_str)]
 
     for m in messages:
         role    = m.get("role", "user")
-        content = m.get("content") or ""
-
-        # تحويل content من list إلى نص
-        if isinstance(content, list):
-            parts = []
-            for c in content:
-                if isinstance(c, dict):
-                    if c.get("type") == "text":
-                        parts.append(c.get("text", ""))
-                    elif c.get("type") == "image_url":
-                        parts.append("[IMAGE]")
-                elif isinstance(c, str):
-                    parts.append(c)
-            content = " ".join(parts).strip()
+        content = _content_to_str(m.get("content") or "")
 
         if role == "system":
-            if content:
-                system_texts.append(content)
-        elif role in ("user", "assistant"):
-            clean.append({"role": role, "content": str(content)})
-        # تجاهل tool/function messages
+            if content.strip():
+                system_parts.append(content.strip())
+        elif role == "user":
+            turns.append(("user", content))
+        elif role == "assistant":
+            # احتفظ بـ content النصي فقط، تجاهل tool_calls
+            if content.strip():
+                turns.append(("assistant", content))
+            else:
+                # إذا كانت فارغة (tool call فقط)، ضع placeholder
+                turns.append(("assistant", "..."))
+        # تجاهل tool/function/tool_result
 
-    # دمج system في أول رسالة user
-    if system_texts and clean:
-        system_combined = "\n\n".join(system_texts)
-        first_user_idx = next((i for i, m in enumerate(clean) if m["role"] == "user"), None)
-        if first_user_idx is not None:
-            clean[first_user_idx]["content"] = (
-                f"[System: {system_combined}]\n\n{clean[first_user_idx]['content']}"
-            )
-    elif system_texts and not clean:
-        # إذا لم تكن هناك رسائل user، أضف system كـ user
-        clean.append({"role": "user", "content": "\n\n".join(system_texts)})
+    # الخطوة 2: دمج system في أول رسالة user (مع قطع إذا كان طويلاً جداً)
+    if system_parts:
+        system_combined = "\n\n".join(system_parts)
+        # قطع الـ system prompt إذا كان أطول من 1500 حرف
+        MAX_SYSTEM = 1500
+        if len(system_combined) > MAX_SYSTEM:
+            system_combined = system_combined[:MAX_SYSTEM] + "\n...[truncated]"
+        # أضف system كـ prefix لأول رسالة user
+        injected = False
+        for i, (role, content) in enumerate(turns):
+            if role == "user":
+                turns[i] = ("user", f"{system_combined}\n\n---\n\n{content}")
+                injected = True
+                break
+        if not injected:
+            turns.insert(0, ("user", system_combined))
 
-    # ضمان تناوب user/assistant (Supabase قد يرفض رسالتين متتاليتين بنفس الـ role)
-    result = []
-    last_role = None
-    for m in clean:
-        if m["role"] == last_role:
-            # دمج مع السابق
-            result[-1]["content"] += "\n" + m["content"]
+    # الخطوة 3: ضمان التناوب — دمج الرسائل المتتالية بنفس الـ role
+    merged = []
+    for role, content in turns:
+        if merged and merged[-1]["role"] == role:
+            merged[-1]["content"] += "\n\n" + content
         else:
-            result.append({"role": m["role"], "content": m["content"]})
-            last_role = m["role"]
+            merged.append({"role": role, "content": content})
 
-    # يجب أن تبدأ بـ user
-    if result and result[0]["role"] != "user":
-        result.insert(0, {"role": "user", "content": ""})
+    # الخطوة 4: يجب أن يبدأ بـ user
+    if merged and merged[0]["role"] != "user":
+        merged.insert(0, {"role": "user", "content": ""})
 
-    return result if result else [{"role": "user", "content": "Hello"}]
+    # الخطوة 5: يجب أن ينتهي بـ user (آخر رسالة هي التي نريد الرد عليها)
+    # إذا انتهى بـ assistant، أضف رسالة user فارغة لإكمال البنية
+    # لا نفعل هذا — Supabase يقبل أن تنتهي بـ user
+
+    # الخطوة 6: تأكد أن كل content ليس None
+    for m in merged:
+        if not m["content"]:
+            m["content"] = " "
+
+    return merged if merged else [{"role": "user", "content": "Hello"}]
 
 
 class DatabaseBackend(BaseBackend):
@@ -864,18 +886,19 @@ class DatabaseBackend(BaseBackend):
         log.info("Database: proxy_id=%s real_model=%s msgs=%d (sanitized from %d)",
                  self._proxy_id, real_model, len(clean_messages), len(messages))
 
-        # طباعة الـ payload كاملاً لتشخيص المشكلة
-        log.info("Database RAW INPUT messages: %s",
-                 json.dumps(messages, ensure_ascii=False)[:500])
-        log.info("Database SANITIZED messages: %s",
-                 json.dumps(clean_messages, ensure_ascii=False)[:500])
+        # logging مفصّل لتشخيص المشكلة
+        for i, m in enumerate(clean_messages):
+            log.info("Database MSG[%d] role=%s content_len=%d preview=%s",
+                     i, m["role"], len(m.get("content", "")),
+                     m.get("content", "")[:80].replace("\n", "\\n"))
 
         payload = {
             "messages": clean_messages,
             "model":    real_model,
         }
 
-        log.info("Database PAYLOAD: %s", json.dumps(payload, ensure_ascii=False)[:600])
+        total_payload = json.dumps(payload, ensure_ascii=False)
+        log.info("Database PAYLOAD total_bytes=%d", len(total_payload.encode("utf-8")))
 
         headers = {
             "Content-Type": "application/json",
