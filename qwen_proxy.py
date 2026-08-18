@@ -568,48 +568,49 @@ async def chat_completions(
 
     _evict_old_sessions()
 
-    async with httpx.AsyncClient() as client:
+    # ── تحديد qwen_chat_id (client مؤقت فقط لإنشاء chat جديد إن لزم) ──
+    sess = _get_session(token, conv_id)
+    if sess:
+        qwen_chat_id = sess["qwen_chat_id"]
+        parent_id    = sess["parent_id"]
+        log.info("Reusing qwen_chat_id=%s for conv_id=%s (parent=%s)",
+                 qwen_chat_id, conv_id, parent_id)
+    else:
+        async with httpx.AsyncClient() as tmp:
+            qwen_chat_id = await _create_chat(token, tmp)
+        parent_id = None
+        _set_session(token, conv_id, qwen_chat_id, parent_id)
+        log.info("New session: conv_id=%s → qwen_chat_id=%s", conv_id, qwen_chat_id)
 
-        # ── هل لدينا محادثة Qwen مسبقة لهذا conv_id؟ ──
-        sess = _get_session(token, conv_id)
-        if sess:
-            qwen_chat_id = sess["qwen_chat_id"]
-            parent_id    = sess["parent_id"]
-            log.info("Reusing qwen_chat_id=%s for conv_id=%s (parent=%s)",
-                     qwen_chat_id, conv_id, parent_id)
-        else:
-            qwen_chat_id = await _create_chat(token, client)
-            parent_id    = None
-            _set_session(token, conv_id, qwen_chat_id, parent_id)
-            log.info("New session: conv_id=%s → qwen_chat_id=%s", conv_id, qwen_chat_id)
+    payload = _build_message_payload(
+        qwen_chat_id, prompt,
+        parent_id=parent_id,
+        stream=True,
+        chat_type="t2t",
+        thinking=thinking,
+        auto_search=auto_search,
+    )
 
-        payload = _build_message_payload(
-            qwen_chat_id, prompt,
-            parent_id=parent_id,
-            stream=True,
-            chat_type="t2t",
-            thinking=thinking,
-            auto_search=auto_search,
-        )
-
-        if do_stream:
-            async def event_stream():
-                last_rid: Optional[str] = None
+    if do_stream:
+        # ✅ client يُنشأ داخل generator ويبقى حياً طوال الـ stream
+        async def event_stream():
+            last_rid: Optional[str] = None
+            async with httpx.AsyncClient() as stream_client:
                 async for chunk, rid in _stream_and_collect(
-                    token, qwen_chat_id, payload, model, client
+                    token, qwen_chat_id, payload, model, stream_client
                 ):
                     yield chunk
                     if rid:
                         last_rid = rid
-                # حفظ parent_id الجديد بعد انتهاء الـ stream
-                _update_parent(token, conv_id, last_rid)
-                log.info("Updated parent_id=%s for conv_id=%s", last_rid, conv_id)
+            _update_parent(token, conv_id, last_rid)
+            log.info("Updated parent_id=%s for conv_id=%s", last_rid, conv_id)
 
-            return StreamingResponse(event_stream(), media_type="text/event-stream")
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-        # ── Non-streaming ──
-        full_content = ""
-        last_rid: Optional[str] = None
+    # ── Non-streaming ──
+    full_content = ""
+    last_rid: Optional[str] = None
+    async with httpx.AsyncClient() as client:
         async for chunk, rid in _stream_and_collect(
             token, qwen_chat_id, payload, model, client
         ):
@@ -623,8 +624,8 @@ async def chat_completions(
                 except Exception:
                     pass
 
-        _update_parent(token, conv_id, last_rid)
-        return JSONResponse(_make_full_response(full_content, model))
+    _update_parent(token, conv_id, last_rid)
+    return JSONResponse(_make_full_response(full_content, model))
 
 
 # ─── Image Generation ─────────────────────────────────────
