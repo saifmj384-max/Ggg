@@ -1190,40 +1190,679 @@ async def _generic_err(request: Request, exc: Exception):
 
 
 # ══════════════════════════════════════════════════════════
+# ★ Kimi Backend  (kimi.com — gRPC/Connect protocol)
+# ══════════════════════════════════════════════════════════
+#
+# البروتوكول: Connect/gRPC-Web بدلاً من REST عادي.
+# كل رسالة = 5-byte header (flag + uint32 length) + JSON body.
+# التوكن = refresh_token يُجدَّد تلقائياً إلى access_token.
+# نموذج افتراضي: SCENARIO_K2D5  (kimi-k2.6)
+#
+# الفرق عن Qwen:
+#   - لا يوجد "chat session" مستمر؛ كل طلب يبني محادثة كاملة
+#   - الرد يصل كـ binary stream (framed messages) لا SSE
+#   - الأدوات الداخلية (search, image...) مُضمَّنة، لكننا نعطّلها
+#     ونستخدم الأدوات الخارجية عبر نفس آلية ACTION: التي يفهمها Qwen
+# ══════════════════════════════════════════════════════════
+
+import struct as _struct
+
+KIMI_BASE      = "https://www.kimi.com"
+KIMI_PROXY_ID  = "kimi"
+
+# النماذج المتاحة (يمكن تحديدها عبر model في الطلب):
+KIMI_MODELS = {
+    "kimi":           "SCENARIO_K2D5",   # kimi-k2.6 (افتراضي)
+    "kimi-k2":        "SCENARIO_K2D5",
+    "kimi-k3":        "SCENARIO_K3",
+    "kimi-auto":      "SCENARIO_UNSPECIFIED",
+    "kimi-solve":     "SCENARIO_PROBLEM_SOLVE",
+}
+
+_KIMI_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/132.0.0.0 Safari/537.36"
+)
+
+
+def _kimi_base_headers(device_id: str) -> Dict:
+    """Headers مشتركة لكل طلبات Kimi."""
+    return {
+        "User-Agent":          _KIMI_UA,
+        "Accept":              "*/*",
+        "Accept-Language":     "en-US,en;q=0.9",
+        "x-msh-device-id":    device_id,
+        "x-msh-platform":     "web",
+        "x-msh-session-id":   "1731757202045822784",
+        "x-msh-version":      "2.0.0",
+        "x-traffic-id":       "d8i4n6nahd86l5du0130",
+        "Origin":              KIMI_BASE,
+        "Referer":             f"{KIMI_BASE}/",
+        "Sec-Ch-Ua":           '"Not A(Brand";v="8", "Chromium";v="132"',
+        "Sec-Ch-Ua-Mobile":    "?0",
+        "Sec-Ch-Ua-Platform":  '"Windows"',
+        "Sec-Fetch-Dest":      "empty",
+        "Sec-Fetch-Mode":      "cors",
+        "Sec-Fetch-Site":      "same-origin",
+        "Cache-Control":       "no-cache",
+        "Pragma":              "no-cache",
+        "R-Timezone":          "Asia/Riyadh",
+        "X-Language":          "en-US",
+    }
+
+
+def _kimi_extract_device_id(refresh_token: str) -> str:
+    """يستخرج device_id من payload الـ JWT."""
+    try:
+        parts = refresh_token.split(".")
+        if len(parts) != 3:
+            raise ValueError("Invalid JWT")
+        payload = parts[1]
+        # إضافة padding
+        payload += "=" * (4 - len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+        device_id = data.get("device_id")
+        if not device_id:
+            raise ValueError("No device_id in JWT")
+        return str(device_id)
+    except Exception as e:
+        log.error("Kimi: failed to extract device_id: %s", e)
+        return "7669233658326224138"  # fallback
+
+
+async def _kimi_refresh_token(refresh_token: str, device_id: str) -> str:
+    """يحوّل refresh_token → access_token."""
+    headers = {
+        **_kimi_base_headers(device_id),
+        "Authorization": f"Bearer {refresh_token}",
+    }
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        resp = await client.get(
+            f"{KIMI_BASE}/api/auth/token/refresh",
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Kimi token refresh failed: {resp.status_code}",
+            )
+        data = resp.json()
+        access_token = data.get("access_token")
+        if not access_token:
+            raise HTTPException(status_code=502, detail="Kimi: no access_token returned")
+        log.info("Kimi: token refreshed OK")
+        return access_token
+
+
+def _kimi_encode_message(payload: Dict) -> bytes:
+    """
+    يُشفّر payload كـ gRPC/Connect frame:
+    [flag:1byte][length:4bytes_big_endian][json_body]
+    """
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    header = _struct.pack(">BI", 0, len(body))
+    return header + body
+
+
+def _kimi_decode_frames(data: bytes) -> List[Dict]:
+    """
+    يُفكّك binary stream من Kimi إلى قائمة JSON objects.
+    كل frame = 5-byte header + JSON body.
+    """
+    results = []
+    offset  = 0
+    while offset + 5 <= len(data):
+        # flag byte (نتجاهله) + uint32 big-endian length
+        length = _struct.unpack(">I", data[offset + 1: offset + 5])[0]
+        end    = offset + 5 + length
+        if end > len(data):
+            break
+        raw = data[offset + 5: end]
+        offset = end
+        try:
+            results.append(json.loads(raw.decode("utf-8")))
+        except Exception:
+            continue
+    return results
+
+
+def _kimi_get_scenario(model_id: str) -> str:
+    """يُعيد SCENARIO المناسب حسب model_id."""
+    return KIMI_MODELS.get(model_id, KIMI_MODELS["kimi"])
+
+
+def _kimi_build_chat_payload(
+    messages:   List[Dict],
+    tools:      List[Dict],
+    thinking:   bool,
+    scenario:   str,
+    system_txt: str,
+) -> Dict:
+    """
+    يبني payload الـ Chat request لـ Kimi.
+
+    بنية الرسائل في Kimi:
+    - كل رسالة user أو assistant تُرسَل كـ block داخل message.blocks
+    - tool results تُرسَل كـ file blocks (Kimi لا يفهم OpenAI tool format)
+    - نعوّض ذلك بتضمين كل شيء في نص واحد (نفس أسلوب Qwen)
+    """
+
+    # ── بناء blocks قائمة الرسائل ───────────────────────
+    kimi_blocks: List[Dict] = []
+
+    # system prompt (يُضاف كأول block)
+    if system_txt:
+        kimi_blocks.append({
+            "role":    "user",
+            "message_id": "",
+            "blocks": [{"role": "user", "content": {"type": "text",
+                         "value": {"content": f"SYSTEM INSTRUCTIONS:\n\n{system_txt}"}}}],
+            "scenario": scenario,
+        })
+
+    # تحويل الرسائل
+    for m in messages:
+        role    = m.get("role", "user")
+        content = m.get("content") or ""
+
+        if role == "system":
+            continue
+
+        elif role == "user":
+            if isinstance(content, list):
+                text_parts = []
+                for c in content:
+                    if isinstance(c, dict):
+                        if c.get("type") == "text":
+                            text_parts.append(c.get("text", ""))
+                        elif c.get("type") == "image_url":
+                            text_parts.append("[IMAGE]")
+                content = " ".join(text_parts)
+            kimi_blocks.append({
+                "role":       "user",
+                "message_id": "",
+                "blocks": [{
+                    "role":    "user",
+                    "content": {"type": "text", "value": {"content": str(content)}},
+                }],
+                "scenario": scenario,
+            })
+
+        elif role == "assistant":
+            if isinstance(content, list):
+                content = " ".join(
+                    c.get("text", "")
+                    for c in content
+                    if isinstance(c, dict) and c.get("type") == "text"
+                )
+            tool_calls = m.get("tool_calls", [])
+            if tool_calls:
+                # assistant أعلن عن tool call سابقاً
+                tc_texts = []
+                for tc in tool_calls:
+                    func = tc.get("function", {})
+                    tc_texts.append(f"ACTION: {func.get('name')}|{func.get('arguments', '{}')}")
+                kimi_blocks.append({
+                    "role":       "assistant",
+                    "message_id": "",
+                    "blocks": [{
+                        "role":    "assistant",
+                        "content": {"type": "text", "value": {"content": "\n".join(tc_texts)}},
+                    }],
+                    "scenario": scenario,
+                })
+            elif content:
+                kimi_blocks.append({
+                    "role":       "assistant",
+                    "message_id": "",
+                    "blocks": [{
+                        "role":    "assistant",
+                        "content": {"type": "text", "value": {"content": str(content)}},
+                    }],
+                    "scenario": scenario,
+                })
+
+        elif role in ("tool", "function"):
+            tool_name = m.get("name") or m.get("tool_call_id", "tool")
+            if isinstance(content, list):
+                content = str(content)
+            result_text = (
+                f"[TOOL RESULT: {tool_name}]\n{content}\n[/TOOL RESULT]"
+            )
+            kimi_blocks.append({
+                "role":       "user",
+                "message_id": "",
+                "blocks": [{
+                    "role":    "user",
+                    "content": {"type": "text", "value": {"content": result_text}},
+                }],
+                "scenario": scenario,
+            })
+
+    if not kimi_blocks:
+        return {}
+
+    # آخر block هو رسالة المستخدم الحالية
+    last_block = kimi_blocks[-1]
+
+    return {
+        "scenario": scenario,
+        "tools":    [],           # نُعطّل أدوات Kimi الداخلية
+        "message": {
+            "role":     "user",
+            "blocks":   last_block.get("blocks", []),
+            "scenario": scenario,
+            "is_goal":  False,
+        },
+        "options": {
+            "thinking":     thinking,
+            "enablePlugin": False,
+        },
+        "project_id": "",
+        # تاريخ المحادثة (ما قبل آخر رسالة)
+        "history": kimi_blocks[:-1] if len(kimi_blocks) > 1 else [],
+    }
+
+
+def _kimi_extract_text_from_frames(frames: List[Dict]) -> str:
+    """
+    يجمع النص الكامل من frames Kimi.
+    يدعم: block.text.content  +  block.think.content (للتفكير)
+    """
+    text_parts = []
+
+    for frame in frames:
+        if "heartbeat" in frame or "notification" in frame:
+            continue
+        if "done" in frame:
+            break
+
+        block = frame.get("block", {})
+        if not block:
+            # قد يكون في message.blocks
+            msg = frame.get("message", {})
+            for blk in msg.get("blocks", []):
+                _kimi_extract_block_text(blk, text_parts)
+            continue
+
+        _kimi_extract_block_text(block, text_parts)
+
+    return "".join(text_parts)
+
+
+def _kimi_extract_block_text(block: Dict, out: List[str]) -> None:
+    """يستخرج النص من block واحد."""
+    # text block
+    txt_val = block.get("text", {})
+    if isinstance(txt_val, dict):
+        c = txt_val.get("content", "")
+        if c:
+            out.append(c)
+            return
+
+    # think block (تفكير — نتجاهله في الرد النهائي)
+    # يمكن إضافته لاحقاً كـ <think>...</think> إذا أردت
+
+    # content-based block
+    content = block.get("content", {})
+    if isinstance(content, dict):
+        if content.get("type") == "text":
+            val = content.get("value", {})
+            c   = val.get("content", "") if isinstance(val, dict) else str(val)
+            if c:
+                out.append(c)
+                return
+
+    # tool block — نتجاهله (نحن نعالج الأدوات عبر ACTION:)
+    # error block
+    err = block.get("error", {})
+    if err:
+        msg = err.get("error", {}).get("message", str(err))
+        out.append(f"[ERROR: {msg}]")
+
+
+class KimiBackend(BaseBackend):
+    """
+    Backend يتصل بـ Kimi (kimi.com) عبر Connect/gRPC protocol.
+
+    التوكن المطلوب: refresh_token من localStorage.getItem('refresh_token')
+    يُجدَّد تلقائياً إلى access_token في كل طلب.
+
+    النماذج المدعومة:
+      kimi / kimi-k2  → SCENARIO_K2D5  (kimi-k2.6)
+      kimi-k3         → SCENARIO_K3
+      kimi-auto       → SCENARIO_UNSPECIFIED
+      kimi-solve      → SCENARIO_PROBLEM_SOLVE
+    """
+
+    @property
+    def model_id(self) -> str:
+        return KIMI_PROXY_ID
+
+    async def complete(
+        self,
+        token:    str,
+        messages: List[Dict],
+        tools:    List[Dict],
+        thinking: bool,
+        conv_id:  str,
+    ) -> AsyncIterator[str]:
+
+        # ── 1. استخراج device_id وتجديد التوكن ──────────
+        device_id    = _kimi_extract_device_id(token)
+        access_token = await _kimi_refresh_token(token, device_id)
+
+        # ── 2. تحديد السيناريو (النموذج) ─────────────────
+        # نبحث عن model في أول رسالة نظام أو نستخدم الافتراضي
+        scenario = _kimi_get_scenario(conv_id.split(":")[0] if ":" in conv_id else KIMI_PROXY_ID)
+
+        # ── 3. بناء system prompt + tools ────────────────
+        system_parts = []
+        for m in messages:
+            if m.get("role") == "system":
+                c = m.get("content") or ""
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                system_parts.append(str(c))
+
+        if tools:
+            system_parts.append(f"\n{tools_to_xml(tools)}\n{TOOL_SYSTEM_SUFFIX}")
+
+        system_txt = "\n\n".join(system_parts)
+
+        # ── 4. بناء payload Kimi ──────────────────────────
+        payload = _kimi_build_chat_payload(
+            messages, tools, thinking, scenario, system_txt
+        )
+        if not payload:
+            yield sse_chunk("[No messages]", model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+            return
+
+        # ── 5. إرسال الطلب واستقبال الـ binary stream ────
+        headers = {
+            **_kimi_base_headers(device_id),
+            "Authorization":            f"Bearer {access_token}",
+            "Content-Type":             "application/connect+json",
+            "connect-protocol-version": "1",
+        }
+        encoded_body = _kimi_encode_message(payload)
+
+        full_text = ""
+        raw_buffer = b""
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=REQUEST_TIMEOUT,
+                follow_redirects=True,
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    f"{KIMI_BASE}/apiv2/kimi.gateway.chat.v1.ChatService/Chat",
+                    headers=headers,
+                    content=encoded_body,
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        log.error("Kimi HTTP %d: %s", resp.status_code, body[:200])
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Kimi API error: {resp.status_code}",
+                        )
+                    async for chunk in resp.aiter_bytes():
+                        raw_buffer += chunk
+
+            # ── 6. تفكيك الـ frames ──────────────────────
+            frames    = _kimi_decode_frames(raw_buffer)
+            full_text = _kimi_extract_text_from_frames(frames)
+            log.info("Kimi: response %d chars from %d frames", len(full_text), len(frames))
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error("Kimi stream error: %s", e, exc_info=True)
+            yield sse_chunk(f"[Kimi error: {e}]", model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+            return
+
+        # ── 7. تحليل: tool call أم نص عادي؟ ─────────────
+        tc = parse_tool_call(full_text)
+
+        if tc:
+            log.info("Kimi tool call: %s", tc["name"])
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
+            yield "data: [DONE]\n\n"
+        else:
+            txt = clean_text(full_text)
+            chunk_size = 40
+            for i in range(0, max(len(txt), 1), chunk_size):
+                yield sse_chunk(txt[i:i + chunk_size], model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+
+
+# سجّل Kimi
+register_backend(KimiBackend())
+
+# ── إضافة نماذج Kimi المتعددة إلى نفس الـ backend ─────────
+for _kimi_alias in ("kimi-k2", "kimi-k3", "kimi-auto", "kimi-solve"):
+    _BACKENDS[_kimi_alias] = KimiBackend()
+
+
+# ══════════════════════════════════════════════════════════
+# تحديث chat_completions لدعم model aliases بشكل صحيح
+# (السيناريو يُستخرج من model field مباشرة)
+# ══════════════════════════════════════════════════════════
+
+# نُعدّل الـ conv_id بحيث يحمل model prefix لـ Kimi
+# حتى يعرف KimiBackend أي scenario يستخدم
+_ORIG_CHAT = app.routes  # نحتفظ بالـ routes
+
+# patch: نُعيد تعريف complete لـ KimiBackend بحيث تقرأ model من conv_id
+
+class _KimiBackendFull(KimiBackend):
+    """نسخة KimiBackend تستقبل model_override في conv_id."""
+
+    async def complete(
+        self,
+        token:    str,
+        messages: List[Dict],
+        tools:    List[Dict],
+        thinking: bool,
+        conv_id:  str,
+    ) -> AsyncIterator[str]:
+        # conv_id يحمل model prefix: "kimi-k3:abc123"
+        parts = conv_id.split(":", 1)
+        model_hint = parts[0] if len(parts) == 2 else KIMI_PROXY_ID
+
+        device_id    = _kimi_extract_device_id(token)
+        access_token = await _kimi_refresh_token(token, device_id)
+        scenario     = _kimi_get_scenario(model_hint)
+
+        system_parts = []
+        for m in messages:
+            if m.get("role") == "system":
+                c = m.get("content") or ""
+                if isinstance(c, list):
+                    c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+                system_parts.append(str(c))
+        if tools:
+            system_parts.append(f"\n{tools_to_xml(tools)}\n{TOOL_SYSTEM_SUFFIX}")
+        system_txt = "\n\n".join(system_parts)
+
+        payload = _kimi_build_chat_payload(
+            messages, tools, thinking, scenario, system_txt
+        )
+        if not payload:
+            yield sse_chunk("[No messages]", model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+            return
+
+        headers = {
+            **_kimi_base_headers(device_id),
+            "Authorization":            f"Bearer {access_token}",
+            "Content-Type":             "application/connect+json",
+            "connect-protocol-version": "1",
+        }
+        encoded_body = _kimi_encode_message(payload)
+        full_text    = ""
+        raw_buffer   = b""
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=REQUEST_TIMEOUT, follow_redirects=True,
+            ) as client:
+                async with client.stream(
+                    "POST",
+                    f"{KIMI_BASE}/apiv2/kimi.gateway.chat.v1.ChatService/Chat",
+                    headers=headers,
+                    content=encoded_body,
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = await resp.aread()
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Kimi API error: {resp.status_code} — {body[:200]}",
+                        )
+                    async for chunk in resp.aiter_bytes():
+                        raw_buffer += chunk
+
+            frames    = _kimi_decode_frames(raw_buffer)
+            full_text = _kimi_extract_text_from_frames(frames)
+            log.info("Kimi[%s] %d chars / %d frames", scenario, len(full_text), len(frames))
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.error("Kimi error: %s", e, exc_info=True)
+            yield sse_chunk(f"[Kimi error: {e}]", model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+            return
+
+        tc = parse_tool_call(full_text)
+        if tc:
+            log.info("Kimi tool call: %s", tc["name"])
+            cid = f"call_{uuid.uuid4().hex[:24]}"
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=cid)
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=cid, finish=True)
+            yield "data: [DONE]\n\n"
+        else:
+            txt = clean_text(full_text)
+            for i in range(0, max(len(txt), 1), 40):
+                yield sse_chunk(txt[i:i + 40], model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+
+
+# استبدل backends Kimi بالنسخة الكاملة
+_kimi_full = _KimiBackendFull()
+for _kid in ("kimi", "kimi-k2", "kimi-k3", "kimi-auto", "kimi-solve"):
+    _BACKENDS[_kid] = _kimi_full
+
+
+# ══════════════════════════════════════════════════════════
+# تحديث chat_completions: نمرر model إلى conv_id لـ Kimi
+# ══════════════════════════════════════════════════════════
+
+# نُلغي الـ route القديم ونُعيد تعريفه مع patch بسيط
+# (FastAPI لا يدعم override routes، لذا نستخدم middleware)
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from starlette.responses import Response as StarletteResponse
+
+
+class _KimiModelPatcher(BaseHTTPMiddleware):
+    """
+    Middleware يُعدّل conv_id لـ Kimi ليشمل model prefix.
+    يعمل بشفافية قبل وصول الطلب للـ route handler.
+    """
+    async def dispatch(
+        self, request: StarletteRequest, call_next
+    ) -> StarletteResponse:
+        # نحتاج patch فقط لـ /v1/chat/completions
+        if request.url.path == "/v1/chat/completions":
+            try:
+                body_bytes = await request.body()
+                body_obj   = json.loads(body_bytes)
+                model      = body_obj.get("model", "")
+
+                # إذا كان نموذج Kimi وما فيه conv_id بعد
+                if model in _BACKENDS and model.startswith("kimi"):
+                    existing_cid = (
+                        body_obj.get("conversation_id")
+                        or body_obj.get("session_id")
+                        or request.headers.get("x-conversation-id")
+                        or request.headers.get("x-session-id")
+                    )
+                    if not existing_cid:
+                        # نضيف prefix بالـ model حتى يُمرَّر للـ backend
+                        key_msgs = body_obj.get("messages", [])[:-1] or body_obj.get("messages", [])[:1]
+                        base_cid = hashlib.md5(
+                            json.dumps(key_msgs, ensure_ascii=False).encode()
+                        ).hexdigest()
+                        # نضيف model prefix
+                        body_obj["conversation_id"] = f"{model}:{base_cid}"
+                        # نُعيد بناء الطلب مع الـ body المعدّل
+                        new_body = json.dumps(body_obj).encode()
+
+                        async def new_receive():
+                            return {"type": "http.request", "body": new_body}
+
+                        request = StarletteRequest(request.scope, new_receive)
+            except Exception:
+                pass  # لا نكسر أي شيء
+
+        return await call_next(request)
+
+
+app.add_middleware(_KimiModelPatcher)
+
+
+# ══════════════════════════════════════════════════════════
+# تحديث list_models لإضافة نماذج Kimi
+# ══════════════════════════════════════════════════════════
+
+# نُعيد تعريف /v1/models بعد إضافة Kimi
+# (FastAPI يُعطي الأولوية للأخير في حالة التكرار)
+@app.get("/v1/models", include_in_schema=False)
+async def list_models_v2():
+    models = []
+    seen   = set()
+    for mid in _BACKENDS:
+        if mid not in seen:
+            models.append({
+                "id":       mid,
+                "object":   "model",
+                "created":  1700000000,
+                "owned_by": "kimi" if mid.startswith("kimi") else "qwen",
+            })
+            seen.add(mid)
+    models.append({
+        "id":       "qwen-vision",
+        "object":   "model",
+        "created":  1700000000,
+        "owned_by": "qwen",
+    })
+    return {"object": "list", "data": models}
+
+
+# ══════════════════════════════════════════════════════════
 # Entry Point
 # ══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v5.0 on port %d", port)
+    log.info(
+        "Starting Universal AI Proxy v5.1 on port %d | backends: %s",
+        port, list(_BACKENDS.keys()),
+    )
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
-
-
-# ══════════════════════════════════════════════════════════
-# ★ دليل إضافة Backend جديد (للمستقبل)
-# ══════════════════════════════════════════════════════════
-#
-# مثال: إضافة Gemini
-#
-# class GeminiBackend(BaseBackend):
-#     @property
-#     def model_id(self) -> str:
-#         return "gemini"
-#
-#     async def complete(self, token, messages, tools, thinking, conv_id):
-#         # استدعاء Gemini API هنا
-#         # ثم:
-#         tc = parse_tool_call(response_text)
-#         if tc:
-#             yield sse_chunk(tc=tc, model=self.model_id)
-#             yield sse_chunk(tc=tc, model=self.model_id, finish=True)
-#             yield "data: [DONE]\n\n"
-#         else:
-#             yield sse_chunk(clean_text(response_text), model=self.model_id)
-#             yield sse_chunk(model=self.model_id, finish=True)
-#             yield "data: [DONE]\n\n"
-#
-# register_backend(GeminiBackend())
-#
-# ══════════════════════════════════════════════════════════
