@@ -799,15 +799,14 @@ def _content_to_str(content) -> str:
     return str(content) if content else ""
 
 
-def _db_sanitize_messages(messages: List[Dict]) -> List[Dict]:
+def _db_prepare(messages: List[Dict]) -> Tuple[Optional[str], List[Dict]]:
     """
-    تنظيف الرسائل قبل إرسالها للـ Supabase.
-    الـ Supabase يقبل فقط: [{"role": "user"|"assistant", "content": "..."}]
-    ويشترط التناوب user/assistant ويبدأ بـ user.
+    يُعيد (system_prompt, clean_messages) للـ Supabase.
+    - system_prompt: نص كامل بدون قطع — يُرسل كـ field منفصل
+    - clean_messages: قائمة {role, content} فقط، تناوب user/assistant، تبدأ بـ user
     """
-    # الخطوة 1: استخراج system prompt وتحويل كل شيء إلى نص
-    system_parts = []
-    turns = []  # [(role, content_str)]
+    system_parts: List[str] = []
+    turns: List[Tuple[str, str]] = []
 
     for m in messages:
         role    = m.get("role", "user")
@@ -819,53 +818,33 @@ def _db_sanitize_messages(messages: List[Dict]) -> List[Dict]:
         elif role == "user":
             turns.append(("user", content))
         elif role == "assistant":
-            # احتفظ بـ content النصي فقط، تجاهل tool_calls
-            if content.strip():
-                turns.append(("assistant", content))
-            else:
-                # إذا كانت فارغة (tool call فقط)، ضع placeholder
-                turns.append(("assistant", "..."))
-        # تجاهل tool/function/tool_result
+            text = content.strip()
+            turns.append(("assistant", text if text else "."))
+        # تجاهل tool / function / tool_result تماماً
 
-    # الخطوة 2: دمج system في أول رسالة user (مع قطع إذا كان طويلاً جداً)
-    if system_parts:
-        system_combined = "\n\n".join(system_parts)
-        # قطع الـ system prompt إذا كان أطول من 1500 حرف
-        MAX_SYSTEM = 1500
-        if len(system_combined) > MAX_SYSTEM:
-            system_combined = system_combined[:MAX_SYSTEM] + "\n...[truncated]"
-        # أضف system كـ prefix لأول رسالة user
-        injected = False
-        for i, (role, content) in enumerate(turns):
-            if role == "user":
-                turns[i] = ("user", f"{system_combined}\n\n---\n\n{content}")
-                injected = True
-                break
-        if not injected:
-            turns.insert(0, ("user", system_combined))
+    system_prompt: Optional[str] = "\n\n".join(system_parts) if system_parts else None
 
-    # الخطوة 3: ضمان التناوب — دمج الرسائل المتتالية بنفس الـ role
-    merged = []
+    # ضمان التناوب — دمج الرسائل المتتالية بنفس الـ role
+    merged: List[Dict] = []
     for role, content in turns:
         if merged and merged[-1]["role"] == role:
             merged[-1]["content"] += "\n\n" + content
         else:
             merged.append({"role": role, "content": content})
 
-    # الخطوة 4: يجب أن يبدأ بـ user
+    # يجب أن تبدأ بـ user
     if merged and merged[0]["role"] != "user":
-        merged.insert(0, {"role": "user", "content": ""})
+        merged.insert(0, {"role": "user", "content": " "})
 
-    # الخطوة 5: يجب أن ينتهي بـ user (آخر رسالة هي التي نريد الرد عليها)
-    # إذا انتهى بـ assistant، أضف رسالة user فارغة لإكمال البنية
-    # لا نفعل هذا — Supabase يقبل أن تنتهي بـ user
-
-    # الخطوة 6: تأكد أن كل content ليس None
+    # تأكد أن كل content ليس فارغاً
     for m in merged:
-        if not m["content"]:
+        if not m["content"].strip():
             m["content"] = " "
 
-    return merged if merged else [{"role": "user", "content": "Hello"}]
+    if not merged:
+        merged = [{"role": "user", "content": " "}]
+
+    return system_prompt, merged
 
 
 class DatabaseBackend(BaseBackend):
@@ -880,25 +859,20 @@ class DatabaseBackend(BaseBackend):
     async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
         real_model = _db_resolve_real_model(self._proxy_id)
 
-        # تنظيف الرسائل
-        clean_messages = _db_sanitize_messages(messages)
+        # استخراج system prompt والرسائل المنظفة
+        system_prompt, clean_messages = _db_prepare(messages)
 
-        log.info("Database: proxy_id=%s real_model=%s msgs=%d (sanitized from %d)",
-                 self._proxy_id, real_model, len(clean_messages), len(messages))
+        log.info("Database: proxy_id=%s real_model=%s msgs=%d→%d system_len=%d",
+                 self._proxy_id, real_model, len(messages), len(clean_messages),
+                 len(system_prompt) if system_prompt else 0)
 
-        # logging مفصّل لتشخيص المشكلة
-        for i, m in enumerate(clean_messages):
-            log.info("Database MSG[%d] role=%s content_len=%d preview=%s",
-                     i, m["role"], len(m.get("content", "")),
-                     m.get("content", "")[:80].replace("\n", "\\n"))
-
-        payload = {
+        # بناء الـ payload — system كـ field منفصل إذا كان موجوداً
+        payload: Dict[str, Any] = {
             "messages": clean_messages,
             "model":    real_model,
         }
-
-        total_payload = json.dumps(payload, ensure_ascii=False)
-        log.info("Database PAYLOAD total_bytes=%d", len(total_payload.encode("utf-8")))
+        if system_prompt:
+            payload["system"] = system_prompt
 
         headers = {
             "Content-Type": "application/json",
