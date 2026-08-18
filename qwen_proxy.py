@@ -1,16 +1,17 @@
 """
-Universal AI Proxy  v7.0
+Universal AI Proxy  v8.0
 =========================
-بروكسي موحد يدعم أربعة نماذج:
+بروكسي موحد يدعم خمسة نماذج:
   ① Qwen           — عبر chat.qwen.ai
   ② DeepSeek Expert — عبر chat.deepseek.com (model_type=expert)
   ③ DeepSeek Default— عبر chat.deepseek.com (model_type=default)
   ④ ChatGPT         — عبر android.chat.openai.com
+  ⑤ Database        — عبر qcpujeurnkbvwlvmylyx.supabase.co (Gemini, GPT, Claude)
 
-إصلاحات v7.0:
-  • conv_id ثابت بناءً على أول رسالة في المحادثة (لا يتغير مع الرسائل الجديدة)
-  • نموذجان منفصلان لـ DeepSeek: "deepseek" (expert) و "deepseek-default"
-  • إصلاح GPT: parsing محسّن للردود
+جديد v8.0:
+  • إضافة Database backend — يدعم نماذج Gemini و GPT و Claude
+  • التوكن الخاص به ثابت: "database-key"
+  • النماذج المتاحة من Database مدرجة في /v1/models
 """
 
 from __future__ import annotations
@@ -90,27 +91,15 @@ async def _evict_old_sessions() -> None:
 
 
 # ══════════════════════════════════════════════════════════
-# ★ conv_id ثابت — الحل الجوهري
-#
-# المشكلة: OpenMinis لا يرسل conversation_id ثابت،
-# فكنا نحسبه من الرسائل وهو يتغير مع كل رسالة جديدة.
-#
-# الحل: نحسب conv_id من أول رسالة فقط (anchor) فيبقى
-# ثابتاً طوال المحادثة بغض النظر عن عدد الرسائل.
+# conv_id ثابت
 # ══════════════════════════════════════════════════════════
 
 def _compute_conv_id(
     messages: List[Dict],
     explicit_id: Optional[str] = None,
 ) -> str:
-    """
-    إذا أرسل العميل conversation_id صريح → نستخدمه.
-    وإلا → نحسبه من أول رسالة فقط (لا تتغير).
-    """
     if explicit_id:
         return explicit_id
-
-    # أول رسالة في المحادثة = المرساة الثابتة
     anchor = messages[:1] if messages else [{"role": "user", "content": "init"}]
     raw    = json.dumps(anchor, ensure_ascii=False, sort_keys=True)
     return "conv_" + hashlib.md5(raw.encode()).hexdigest()
@@ -280,7 +269,6 @@ def parse_tool_call(text: str) -> Optional[Dict]:
     if m:
         return _make_tc(m.group(1), m.group(2))
 
-    # Branch 3: XML parameters style (من v6)
     m_name   = re.search(r"<name>(.*?)</name>", text, re.IGNORECASE)
     m_params = re.findall(
         r"<parameter[=:](\w+)>\s*(.*?)\s*</parameter>",
@@ -540,13 +528,6 @@ register_backend(QwenBackend())
 
 # ══════════════════════════════════════════════════════════
 # BACKEND 2 & 3: DeepSeek (Expert + Default)
-#
-# ★ الإصلاح الرئيسي: conv_id ثابت = لا نُنشئ جلسة جديدة
-#   إلا عند أول رسالة في المحادثة.
-#
-# ★ نموذجان:
-#   "deepseek"         → model_type=expert  (الافتراضي الأقوى)
-#   "deepseek-default" → model_type=default (السريع)
 # ══════════════════════════════════════════════════════════
 
 DEEPSEEK_PROXY_ID_EXPERT  = "deepseek"
@@ -627,14 +608,8 @@ async def _ds_create_session(token: str, client: httpx.AsyncClient) -> str:
 
 
 class DeepSeekBackend(BaseBackend):
-    """
-    Backend عام لـ DeepSeek — يُنشئ نموذجين:
-      deepseek         → expert
-      deepseek-default → default
-    """
-
     def __init__(self, proxy_id: str, model_type: str):
-        self._proxy_id  = proxy_id
+        self._proxy_id   = proxy_id
         self._model_type = model_type
 
     @property
@@ -642,7 +617,6 @@ class DeepSeekBackend(BaseBackend):
         return self._proxy_id
 
     async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
-        # model_type: يمكن تجاوزه من extra لكن الافتراضي من النموذج نفسه
         model_type     = extra.get("model_type", self._model_type)
         search_enabled = extra.get("search_enabled", True)
 
@@ -652,7 +626,6 @@ class DeepSeekBackend(BaseBackend):
 
         await _evict_old_sessions()
 
-        # ★ الإصلاح: conv_id ثابت → نُنشئ جلسة DeepSeek مرة واحدة فقط
         sess = await _get_session(token, conv_id)
         async with httpx.AsyncClient() as client:
             if sess:
@@ -661,7 +634,6 @@ class DeepSeekBackend(BaseBackend):
                 log.info("DeepSeek[%s]: reusing session=%s parent=%s",
                          model_type, session_id, parent_message_id)
             else:
-                # أول مرة في هذه المحادثة → ننشئ جلسة واحدة
                 session_id        = await _ds_create_session(token, client)
                 parent_message_id = None
                 await _set_session(token, conv_id, {
@@ -743,7 +715,6 @@ class DeepSeekBackend(BaseBackend):
                 yield "data: [DONE]\n\n"
                 return
 
-        # حفظ parent_message_id الجديد للرسالة التالية
         if new_parent_msg_id:
             await _update_session(token, conv_id, ds_parent_msg_id=new_parent_msg_id)
 
@@ -768,15 +739,12 @@ class DeepSeekBackend(BaseBackend):
             yield "data: [DONE]\n\n"
 
 
-# تسجيل نموذجين DeepSeek
 register_backend(DeepSeekBackend(DEEPSEEK_PROXY_ID_EXPERT,  "expert"))
 register_backend(DeepSeekBackend(DEEPSEEK_PROXY_ID_DEFAULT, "default"))
 
 
 # ══════════════════════════════════════════════════════════
 # BACKEND 4: ChatGPT (GPT-5)
-#
-# ★ إصلاح v7: parsing محسّن + debug logging للرد الخام
 # ══════════════════════════════════════════════════════════
 
 GPT_PROXY_ID   = "gpt"
@@ -836,13 +804,6 @@ async def _gpt_prepare_conduit(authorization: str, client: httpx.AsyncClient) ->
 
 
 class GPTBackend(BaseBackend):
-    """
-    ★ إصلاح v7:
-      1. نُسجّل كل سطر خام للـ debug (أول 20 سطر فقط)
-      2. ندعم صيغ append مختلفة
-      3. نعيد محاولة parsing بطرق متعددة
-    """
-
     @property
     def model_id(self) -> str:
         return GPT_PROXY_ID
@@ -857,7 +818,6 @@ class GPTBackend(BaseBackend):
 
         await _evict_old_sessions()
 
-        # آخر رسالة مستخدم
         last_user_msg = ""
         for m in reversed(messages):
             if m.get("role") == "user":
@@ -947,7 +907,6 @@ class GPTBackend(BaseBackend):
             new_conv_id   = conversation_id
             new_parent_id = parent_msg_id
 
-            # ★ debug: نحفظ أول 30 سطر خام لنرى ماذا يُرسل GPT
             raw_lines_debug: List[str] = []
 
             try:
@@ -959,7 +918,6 @@ class GPTBackend(BaseBackend):
                         if not raw_line:
                             continue
 
-                        # debug أول 30 سطر
                         if len(raw_lines_debug) < 30:
                             raw_lines_debug.append(raw_line[:200])
 
@@ -974,7 +932,6 @@ class GPTBackend(BaseBackend):
                         except json.JSONDecodeError:
                             continue
 
-                        # conversation_id
                         if obj.get("conversation_id"):
                             new_conv_id = obj["conversation_id"]
 
@@ -982,14 +939,12 @@ class GPTBackend(BaseBackend):
                         p_op = obj.get("p", "")
                         v_op = obj.get("v")
 
-                        # ★ صيغة 1: append مباشر
                         if (o_op in ("append", "APPEND")
                                 and isinstance(v_op, str)
                                 and ("content/parts/0" in p_op or "parts/0" in p_op)):
                             full_text += v_op
                             continue
 
-                        # ★ صيغة 2: patch قائمة
                         if o_op in ("patch", "PATCH") and isinstance(v_op, list):
                             for patch in v_op:
                                 po = patch.get("o", "")
@@ -1001,33 +956,25 @@ class GPTBackend(BaseBackend):
                                     full_text += pv
                             continue
 
-                        # ★ صيغة 3: message كامل
                         msg = obj.get("message") or {}
                         if msg:
                             if msg.get("id"):
                                 new_parent_id = msg["id"]
-                            # محتوى داخل message
                             msg_content = msg.get("content") or {}
                             parts = msg_content.get("parts", [])
                             if parts and isinstance(parts[0], str) and parts[0]:
-                                # هذا رد كامل — نستخدمه فقط إذا لم يكن لدينا شيء بعد
                                 if not full_text:
                                     full_text = parts[0]
                             continue
 
-                        # ★ صيغة 4: delta (OpenAI standard)
                         choices = obj.get("choices", [])
                         if choices:
                             delta   = choices[0].get("delta", {})
                             content = delta.get("content", "")
                             if content:
                                 full_text += content
-                            fr = choices[0].get("finish_reason")
-                            if fr:
-                                pass
                             continue
 
-                        # ★ صيغة 5: v مباشر بدون p
                         if isinstance(v_op, str) and v_op and not p_op and not o_op:
                             full_text += v_op
 
@@ -1038,7 +985,6 @@ class GPTBackend(BaseBackend):
                 yield "data: [DONE]\n\n"
                 return
 
-        # ★ طباعة debug lines للـ log
         if raw_lines_debug:
             log.info("GPT raw lines sample (first %d):", len(raw_lines_debug))
             for i, line in enumerate(raw_lines_debug):
@@ -1070,6 +1016,168 @@ register_backend(GPTBackend())
 
 
 # ══════════════════════════════════════════════════════════
+# BACKEND 5: Database (Supabase — Gemini / GPT / Claude)
+#
+# التوكن الثابت: "database-key"
+# الـ URL الفعلي ثابت داخل الكود، لا يحتاج توكن حقيقي.
+#
+# النماذج المدعومة (تُرسَل مباشرة كـ model في الـ payload):
+#   google/gemini-2.5-flash
+#   google/gemini-2.5-flash-lite
+#   google/gemini-2.5-pro
+#   openai/gpt-5-nano
+#   openai/gpt-5-mini
+#   openai/gpt-5
+#   anthropic/claude-3-5-haiku-20241022
+#   anthropic/claude-sonnet-4-5
+#   anthropic/claude-opus-4-1-20250805
+#   anthropic/claude-sonnet-5
+#   anthropic/claude-fable-5
+# ══════════════════════════════════════════════════════════
+
+DATABASE_FIXED_TOKEN = "database-key"
+DATABASE_URL         = "https://qcpujeurnkbvwlvmylyx.supabase.co/functions/v1/chat"
+DATABASE_TIMEOUT     = 180
+
+# النماذج المتاحة من الـ Database مع أسمائها المختصرة في البروكسي
+DATABASE_MODELS: Dict[str, str] = {
+    # اسم النموذج في البروكسي (model في OpenMinis) → اسمه الحقيقي عند الـ Supabase
+    "db-gemini-flash":         "google/gemini-2.5-flash",
+    "db-gemini-flash-lite":    "google/gemini-2.5-flash-lite",
+    "db-gemini-pro":           "google/gemini-2.5-pro",
+    "db-gpt-5-nano":           "openai/gpt-5-nano",
+    "db-gpt-5-mini":           "openai/gpt-5-mini",
+    "db-gpt-5":                "openai/gpt-5",
+    "db-claude-haiku":         "anthropic/claude-3-5-haiku-20241022",
+    "db-claude-sonnet":        "anthropic/claude-sonnet-4-5",
+    "db-claude-opus":          "anthropic/claude-opus-4-1-20250805",
+    "db-claude-sonnet-5":      "anthropic/claude-sonnet-5",
+    "db-claude-fable":         "anthropic/claude-fable-5",
+}
+
+# قائمة عكسية: الاسم الحقيقي → اسم البروكسي (للتعرف التلقائي)
+_DB_REAL_TO_PROXY: Dict[str, str] = {v: k for k, v in DATABASE_MODELS.items()}
+
+
+def _db_resolve_real_model(model_id: str) -> str:
+    """
+    يحوّل اسم النموذج من صيغة البروكسي إلى الاسم الحقيقي عند Supabase.
+    إذا أرسل المستخدم الاسم الحقيقي مباشرة (google/...) يُعيده كما هو.
+    """
+    # اسم بروكسي معروف
+    if model_id in DATABASE_MODELS:
+        return DATABASE_MODELS[model_id]
+    # اسم حقيقي مباشر (مثل google/gemini-2.5-flash)
+    if "/" in model_id:
+        return model_id
+    # افتراضي
+    return "google/gemini-2.5-flash"
+
+
+def _db_is_database_token(token: str) -> bool:
+    """التحقق من أن التوكن هو توكن الـ Database وليس Qwen أو DeepSeek"""
+    return token.strip() == DATABASE_FIXED_TOKEN
+
+
+class DatabaseBackend(BaseBackend):
+    """
+    Backend للـ Database (Supabase).
+    يقبل أي model_id يبدأ بـ "db-" أو الأسماء الحقيقية مباشرة.
+    يُرسل الرسائل كما هي (OpenAI format) إلى Supabase ويعيد الـ stream.
+    """
+
+    def __init__(self, proxy_id: str, real_model: str):
+        self._proxy_id  = proxy_id
+        self._real_model = real_model
+
+    @property
+    def model_id(self) -> str:
+        return self._proxy_id
+
+    async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
+        # تحديد الـ model الحقيقي
+        real_model = _db_resolve_real_model(self._proxy_id)
+
+        log.info("Database: proxy_id=%s real_model=%s msgs=%d",
+                 self._proxy_id, real_model, len(messages))
+
+        # بناء الـ payload — نفس صيغة الملف الثاني بالضبط
+        payload = {
+            "messages": messages,
+            "model":    real_model,
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept":       "text/event-stream",
+        }
+
+        full_text = ""
+
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST", DATABASE_URL,
+                    json=payload, headers=headers,
+                    timeout=DATABASE_TIMEOUT,
+                ) as resp:
+                    if resp.status_code >= 400:
+                        err_body = await resp.aread()
+                        err_msg  = err_body.decode("utf-8", errors="replace")
+                        log.error("Database HTTP %d: %s", resp.status_code, err_msg[:200])
+                        yield sse_chunk(
+                            f"[Database Error {resp.status_code}: {err_msg[:100]}]",
+                            model=self._proxy_id,
+                        )
+                        yield sse_chunk(model=self._proxy_id, finish=True)
+                        yield "data: [DONE]\n\n"
+                        return
+
+                    async for raw_line in resp.aiter_lines():
+                        if not raw_line:
+                            continue
+                        if not raw_line.startswith("data: "):
+                            continue
+                        ds = raw_line[6:].strip()
+                        if ds == "[DONE]":
+                            break
+                        try:
+                            obj = json.loads(ds)
+                            choices = obj.get("choices", [])
+                            if choices:
+                                delta   = choices[0].get("delta", {})
+                                content = delta.get("content")
+                                if content:
+                                    # تنظيف surrogates (كما في الملف الثاني)
+                                    content = content.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+                                    full_text += content
+                                    # نبث مباشرة chunk بـ chunk
+                                    yield sse_chunk(content, model=self._proxy_id)
+                        except (json.JSONDecodeError, KeyError, IndexError):
+                            continue
+
+        except Exception as e:
+            log.error("Database stream error: %s", e)
+            yield sse_chunk(f"[Database Error: {e}]", model=self._proxy_id)
+            yield sse_chunk(model=self._proxy_id, finish=True)
+            yield "data: [DONE]\n\n"
+            return
+
+        log.info("Database: done real_model=%s text_len=%d", real_model, len(full_text))
+
+        if not full_text:
+            yield sse_chunk("[Database: empty response]", model=self._proxy_id)
+
+        yield sse_chunk(model=self._proxy_id, finish=True)
+        yield "data: [DONE]\n\n"
+
+
+# تسجيل كل نماذج الـ Database
+for _proxy_id, _real_model in DATABASE_MODELS.items():
+    register_backend(DatabaseBackend(_proxy_id, _real_model))
+
+
+# ══════════════════════════════════════════════════════════
 # Helpers
 # ══════════════════════════════════════════════════════════
 
@@ -1091,7 +1199,6 @@ def resolve_extra(body: Dict, model: str) -> Dict:
     if model in (DEEPSEEK_PROXY_ID_EXPERT, DEEPSEEK_PROXY_ID_DEFAULT):
         mt = extra_body.get("model_type") or body.get("model_type")
         if not mt:
-            # نستخدم model_type المرتبط بالنموذج نفسه
             mt = "expert" if model == DEEPSEEK_PROXY_ID_EXPERT else "default"
         extra["model_type"] = mt if mt in ("default", "expert") else "expert"
         se = extra_body.get("search_enabled")
@@ -1137,7 +1244,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="7.0.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="8.0.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -1148,33 +1255,64 @@ def _extract_token(authorization: Optional[str]) -> str:
     return parts[1].strip() if len(parts) == 2 else parts[0].strip()
 
 
+def _is_database_model(model: str) -> bool:
+    """هل النموذج المطلوب ينتمي لـ Database backend؟"""
+    return model in DATABASE_MODELS or model in _DB_REAL_TO_PROXY
+
+
 @app.get("/", tags=["health"])
 async def health():
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "7.0.0",
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "8.0.0",
         "active_sessions": len(_sessions), "backends": list(_BACKENDS.keys()),
         "models": {
+            # النماذج الأصلية
             "qwen":             "Qwen3.8-max via chat.qwen.ai",
             "deepseek":         "DeepSeek Expert via chat.deepseek.com",
             "deepseek-default": "DeepSeek Default (fast) via chat.deepseek.com",
             "gpt":              "ChatGPT GPT-5 via android.chat.openai.com",
+            # Database
+            **{pid: f"{rm} via Supabase Database" for pid, rm in DATABASE_MODELS.items()},
         },
+        "database_token": DATABASE_FIXED_TOKEN,
         "notes": [
-            "v7: conv_id is now stable (anchored to first message) — no more new DS sessions per turn",
+            "v8: Database backend added — Gemini, GPT-5, Claude via Supabase",
+            "v8: Database token is fixed: 'database-key' (no real auth needed)",
+            "v7: conv_id is stable (anchored to first message)",
             "v7: Two DeepSeek models: 'deepseek' (expert) and 'deepseek-default' (fast)",
-            "v7: GPT parsing improved with multi-format support + debug logging",
-            "GPT token = full Authorization header value (Bearer eyJ...)",
         ],
     }
 
 
 @app.get("/v1/models", tags=["models"])
 async def list_models():
-    models = [
-        {"id": mid, "object": "model", "created": 1700000000, "owned_by": "proxy"}
-        for mid in _BACKENDS
-    ]
-    models.append({"id": "qwen-vision", "object": "model", "created": 1700000000, "owned_by": "qwen"})
+    models = []
+
+    # النماذج الأصلية
+    for mid in ["qwen", "deepseek", "deepseek-default", "gpt"]:
+        if mid in _BACKENDS:
+            models.append({
+                "id": mid, "object": "model",
+                "created": 1700000000, "owned_by": "proxy",
+            })
+
+    # نماذج Qwen Vision
+    models.append({
+        "id": "qwen-vision", "object": "model",
+        "created": 1700000000, "owned_by": "qwen",
+    })
+
+    # نماذج Database
+    for proxy_id, real_model in DATABASE_MODELS.items():
+        provider = real_model.split("/")[0]  # google / openai / anthropic
+        models.append({
+            "id":         proxy_id,
+            "object":     "model",
+            "created":    1700000000,
+            "owned_by":   f"database-{provider}",
+            "real_model": real_model,
+        })
+
     return {"object": "list", "data": models}
 
 
@@ -1190,16 +1328,37 @@ async def chat_completions(
     do_stream = body.get("stream", False)
     model    = body.get("model", QWEN_PROXY_ID)
 
-    # GPT: نمرر Authorization كاملاً
+    # ── توجيه التوكن حسب النموذج ──────────────────────────
     if model == GPT_PROXY_ID:
         effective_token = authorization or token
     else:
         effective_token = token
 
+    # ── التحقق من توكن Database ───────────────────────────
+    # إذا كان النموذج db-* لكن التوكن غير صحيح → خطأ واضح
+    if _is_database_model(model) and not _db_is_database_token(token):
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                f"Database models require token '{DATABASE_FIXED_TOKEN}'. "
+                f"Received: '{token[:20]}...'"
+            ),
+        )
+
+    # إذا كان التوكن هو database-key لكن النموذج ليس db-* → خطأ واضح
+    if _db_is_database_token(token) and not _is_database_model(model):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Token '{DATABASE_FIXED_TOKEN}' is only for Database models (db-*). "
+                f"Model '{model}' is not a Database model."
+            ),
+        )
+
     thinking = resolve_thinking(body)
     extra    = resolve_extra(body, model)
 
-    # ★ conv_id ثابت — الإصلاح الرئيسي
+    # ── conv_id ثابت ──────────────────────────────────────
     explicit_conv_id = (
         body.get("conversation_id")
         or body.get("session_id")
@@ -1217,6 +1376,11 @@ async def chat_completions(
         raise HTTPException(status_code=429, detail="Duplicate request — please retry in a moment.")
 
     backend = get_backend(model)
+    if backend is None:
+        # محاولة الاسم الحقيقي → اسم البروكسي
+        proxy_id = _DB_REAL_TO_PROXY.get(model)
+        if proxy_id:
+            backend = get_backend(proxy_id)
     if backend is None:
         backend = get_backend(QWEN_PROXY_ID)
         if backend is None:
@@ -1448,59 +1612,46 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v7.0 on port %d", port)
+    log.info("Starting Universal AI Proxy v8.0 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 
 # ══════════════════════════════════════════════════════════
-# ملخص استخدام الـ API  (v7.0)
+# ملخص استخدام الـ API  (v8.0)
 # ══════════════════════════════════════════════════════════
 #
 # ① Qwen:
 #    POST /v1/chat/completions
 #    Authorization: Bearer <qwen_token>
-#    {"model": "qwen", "messages": [...], "thinking": true/false}
+#    {"model": "qwen", "messages": [...]}
 #
-# ② DeepSeek Expert (الأقوى):
-#    POST /v1/chat/completions
+# ② DeepSeek Expert:
 #    Authorization: Bearer <deepseek_token>
-#    {
-#      "model": "deepseek",
-#      "messages": [...],
-#      "thinking": true/false,
-#      "extra_body": {
-#        "search_enabled": true       // أو false
-#      }
-#    }
+#    {"model": "deepseek", "messages": [...]}
 #
-# ③ DeepSeek Default (السريع):
-#    POST /v1/chat/completions
+# ③ DeepSeek Default:
 #    Authorization: Bearer <deepseek_token>
-#    {
-#      "model": "deepseek-default",
-#      "messages": [...],
-#      "thinking": false,
-#      "extra_body": {
-#        "search_enabled": true       // أو false
-#      }
-#    }
-#    - في OpenMinis: أضف نموذجين بنفس التوكن، model يتغير فقط
-#    - thinking chunk منفصل: data: {"type":"thinking","content":"..."}
-#    - باقي الرد بصيغة OpenAI العادية
+#    {"model": "deepseek-default", "messages": [...]}
 #
 # ④ GPT:
-#    POST /v1/chat/completions
-#    Authorization: Bearer eyJ...  (Authorization header الكامل)
+#    Authorization: Bearer eyJ...
 #    {"model": "gpt", "messages": [...]}
-#    - thinking يُتجاهل
-#    - extra_body.cookie: "..." اختياري لتحسين الاستقرار
 #
-# ══════════════════════════════════════════════════════════
-# ملاحظات v7 الجديدة:
-#   • conv_id مرتكز على أول رسالة فقط (ثابت طوال المحادثة)
-#   • لا تُنشأ جلسة DeepSeek جديدة مع كل رسالة
-#   • نموذجان لـ DeepSeek في OpenMinis:
-#     - "deepseek"         → Expert  (أبطأ، أقوى)
-#     - "deepseek-default" → Default (أسرع، خفيف)
-#   • GPT: parsing يدعم 5 صيغ مختلفة + debug logging
+# ⑤ Database (جديد v8):
+#    Authorization: Bearer database-key
+#    {"model": "<proxy_id>", "messages": [...]}
+#
+#    النماذج المتاحة (proxy_id → النموذج الحقيقي):
+#      db-gemini-flash       → google/gemini-2.5-flash
+#      db-gemini-flash-lite  → google/gemini-2.5-flash-lite
+#      db-gemini-pro         → google/gemini-2.5-pro
+#      db-gpt-5-nano         → openai/gpt-5-nano
+#      db-gpt-5-mini         → openai/gpt-5-mini
+#      db-gpt-5              → openai/gpt-5
+#      db-claude-haiku       → anthropic/claude-3-5-haiku-20241022
+#      db-claude-sonnet      → anthropic/claude-sonnet-4-5
+#      db-claude-opus        → anthropic/claude-opus-4-1-20250805
+#      db-claude-sonnet-5    → anthropic/claude-sonnet-5
+#      db-claude-fable       → anthropic/claude-fable-5
+#
 # ══════════════════════════════════════════════════════════
