@@ -819,8 +819,10 @@ def _db_prepare(messages: List[Dict]) -> Tuple[Optional[str], List[Dict]]:
             turns.append(("user", content))
         elif role == "assistant":
             text = content.strip()
-            turns.append(("assistant", text if text else "."))
-        # تجاهل tool / function / tool_result تماماً
+            # إذا كانت فارغة (tool_call فقط أو thinking) — تجاهل تماماً
+            if text:
+                turns.append(("assistant", text))
+        # تجاهل tool / function / tool_result / thinking تماماً
 
     system_prompt: Optional[str] = "\n\n".join(system_parts) if system_parts else None
 
@@ -866,13 +868,34 @@ class DatabaseBackend(BaseBackend):
                  self._proxy_id, real_model, len(messages), len(clean_messages),
                  len(system_prompt) if system_prompt else 0)
 
-        # بناء الـ payload — system كـ field منفصل إذا كان موجوداً
+        # طباعة بنية كل رسالة خام لتشخيص مشكلة thinking=True
+        for i, m in enumerate(messages):
+            keys = list(m.keys())
+            role = m.get("role","?")
+            clen = len(str(m.get("content") or ""))
+            has_tc = bool(m.get("tool_calls"))
+            log.info("RAW[%d] role=%s keys=%s content_len=%d tool_calls=%s",
+                     i, role, keys, clen, has_tc)
+        log.info("CLEAN msgs=%d: %s",
+                 len(clean_messages),
+                 [(m["role"], len(m["content"])) for m in clean_messages])
+
+        # دمج system في أول رسالة user إذا وُجد
+        if system_prompt and clean_messages:
+            first_user = next((i for i, m in enumerate(clean_messages) if m["role"] == "user"), None)
+            if first_user is not None:
+                clean_messages[first_user]["content"] = (
+                    system_prompt + "\n\n---\n\n" + clean_messages[first_user]["content"]
+                )
+            else:
+                clean_messages.insert(0, {"role": "user", "content": system_prompt})
+        elif system_prompt:
+            clean_messages = [{"role": "user", "content": system_prompt}]
+
         payload: Dict[str, Any] = {
             "messages": clean_messages,
             "model":    real_model,
         }
-        if system_prompt:
-            payload["system"] = system_prompt
 
         headers = {
             "Content-Type": "application/json",
