@@ -1,17 +1,16 @@
 """
-Universal AI Proxy  v8.0
+Universal AI Proxy  v8.1
 =========================
-بروكسي موحد يدعم خمسة نماذج:
+بروكسي موحد يدعم أربعة نماذج:
   ① Qwen           — عبر chat.qwen.ai
   ② DeepSeek Expert — عبر chat.deepseek.com (model_type=expert)
   ③ DeepSeek Default— عبر chat.deepseek.com (model_type=default)
-  ④ ChatGPT         — عبر android.chat.openai.com
-  ⑤ Database        — عبر qcpujeurnkbvwlvmylyx.supabase.co (Gemini, GPT, Claude)
+  ④ Database        — عبر qcpujeurnkbvwlvmylyx.supabase.co (Gemini, GPT, Claude)
 
-جديد v8.0:
-  • إضافة Database backend — يدعم نماذج Gemini و GPT و Claude
-  • التوكن الخاص به ثابت: "database-key"
-  • النماذج المتاحة من Database مدرجة في /v1/models
+تغييرات v8.1:
+  • حذف GPT backend نهائياً
+  • إصلاح Database: تنظيف messages قبل الإرسال (إزالة حقول thinking وغيرها)
+  • إصلاح Database: تحويل system messages إلى user message أول
 """
 
 from __future__ import annotations
@@ -744,304 +743,16 @@ register_backend(DeepSeekBackend(DEEPSEEK_PROXY_ID_DEFAULT, "default"))
 
 
 # ══════════════════════════════════════════════════════════
-# BACKEND 4: ChatGPT (GPT-5)
-# ══════════════════════════════════════════════════════════
-
-GPT_PROXY_ID   = "gpt"
-GPT_BASE_URL   = "https://android.chat.openai.com/backend-api"
-GPT_STABLE_ID  = "5d2b760d-7e29-40da-bc66-06ca6e28806a"
-GPT_DEVICE_ID  = "4cdd060c-f77d-4944-aedb-46ef8aa8bb38"
-GPT_MODEL      = "gpt-5-5"
-GPT_ACCOUNT_ID = "6a6cac80-ff60-83ea-8e92-b6c8156af25f"
-
-GPT_SENTINEL_PAYLOAD = (
-    '{"bot_token":{"play_integrity_token":"CrMCARCnMGuYmzFJH-LB0wNNTzP1k-kmDrSLKNTYvoZXzR2Zne_AYqlPnp2GDMV9WlF52PvI00Babh54uEkFHahWaY_jTq9KTZ19PPU83ZJ0NzUi-eZI-KuPetJfZFsOuBzQkoHtcjTvXED0YG-u9A0P2-d5UOTg-KNjb58j2-nx8eBUAZ86q8GuRzUQUUZzD0g7Y1iXggxnmSc17v5FDhvo-Dm6Ma0ArxP2rZi0bT4AX5CQawq-FzRB2qjIJV-apy0r3C78iX46J8mkST2IsNWToAKi7EG9-aLJeNjfYscjunDH-C9PLdppAGAfki9Fnnvos6FfFkYtkU_9-gSNZ1_FQYhBpAvsauaiVRICzdAGo17WcO78r0cfV56qbXghNHdpQm1Vx32gO4k-0_lQvg9ii9cSKxp-AVDILS3yconjokLr891GPEhBjbWS5vkHDV8HuH5__gDWn5E22xK9mtjuXi6Lij-vva88cpaJaYnGB_5bl8-AmDPiZzVwC2fxSMZhCl0EvZrf-jaUdwHtuhOsya-63uoweH6nj2GMVRxPIE_CM4Lj8MrUFj6oG5FAl2uc2UIl","chat_requirement_token":"gAAAAABqa4dkAuZ1kMHlVAHVqBkHwkRmnFMFVoR6Ce75hQ4QmYoQnqmrGOAeU1WUyEzgVzPEtSohzSSs3ILEXozZQR2BFsBDv9-YX9IegEPyp5hfQNRH39H3hpX4XU2sHkdGBTBehgKwj7vyNPvAuQ94IQNwjxm7sbC8aXLgoWYjK_p5xdik_CqmLkFjQWUhoozqxOnPEzDwybCwogxn4_CSWUKCOK0YerpTgXjWoEFrGIgj_EXOV_pE5pvJamOA2sK1GzOC6RVpMbtgyQUm_aQYh6GgtSDOJm2imURp6Ai0PG2QSIvj49sb0Vgod4NhYn27qyzFGSOFeEfgVFllAEGPysdqHQfdUks0RNM-7CAOxUK0E5WgDhhoeM1S8aOwtg_7JNHPziqhauUaIF3_ls7_laqFATtv9Ydzr2W6Ka-T6g8rmHwgo69VXqqr7Prgd8LYwvXN0GRXdXYBNW4dC9EDnMOWcNQkbO9SiOcGtBqSDblYNSBrIG_YUNBGGFhM3QTmTg1pIfP4lO7rlxwy6N1Em6RqzX95Md0czVluz97VHsec3rDVPoP6HV7EPlfUhyepwTuzElPrVJXXzSYjBK4OR5BoqFJoApDr3whGkkFCj1v9D3crUkv4wLDA1xEG6D9L7eBVUkgvNUbzDTAVm8i7kC85c_qOcpmRcQVR2VjgWsLkVwSXz_tpRrI4C1DMqdFppvxbMoEjB0VeH455UkI6V4gjDEOcu3R0P7gr71i1PWG56O85myOv0K9zGbcHaMwJ7f_X7rl79ygVGttp22FIeJ5ZNfI3-IUV7WN8J2rbIOfS9WFKY8nTSQgQ3ITYdGNYWjaNS6gsZwH-hizcHpQH574wcMJE9rLikX-mw-qmi56xzL3eEjxgwHUARyNTwqDY_dfuw9ZqmVZu2kvQ6_Jn7HW6JVkEw1y7km-SLLU7dad0AvsUavLO9FdbpeykMseZ3IrJu0LdjyRLPpOiYQQ77Vni9Woy5wZmDQ56WwCZYlLdDbpq0yPuyAusKtCA1hPj0oF6WjwrnKxmTymF62hVxKFPrslEtA=="}}'
-)
-
-
-def _gpt_base_headers(authorization: str, device_id: Optional[str] = None) -> Dict[str, str]:
-    did = device_id or GPT_DEVICE_ID
-    return {
-        "User-Agent":                "ChatGPT/1.2026.195 (Android 16; 24117RN76G; build 2619512)",
-        "Accept":                    "application/json",
-        "Accept-Encoding":           "gzip",
-        "Content-Type":              "application/json",
-        "oai-package-name":          "com.openai.chatgpt",
-        "oai-client-type":           "android",
-        "oai-device-id":             did,
-        "accept-language":           "ar,en-US;q=0.9",
-        "x-device-tier":             "mid",
-        "chatgpt-account-id":        GPT_ACCOUNT_ID,
-        "chatgpt-residency-region":  "no_constraint",
-        "x-storefront-country-code": "US",
-        "authorization":             authorization,
-    }
-
-
-async def _gpt_prepare_conduit(authorization: str, client: httpx.AsyncClient) -> Optional[str]:
-    url = f"{GPT_BASE_URL}/f/conversation/prepare"
-    payload = {
-        "action": "next", "messages": [], "model": GPT_MODEL,
-        "history_and_training_disabled": False, "fork_from_shared_post": False,
-        "enable_message_followups": True, "force_use_sse": False,
-        "force_use_search": None, "force_paragen": False,
-        "supported_encodings": ["v1"], "supports_buffering": True,
-        "timezone": "Africa/Cairo", "timezone_offset_min": -180,
-        "system_hints": [], "is_onboarding_conversation": False,
-        "client_prepare_dispatch": "debounced",
-        "client_prepare_source": "composer_editor_state",
-    }
-    try:
-        resp  = await client.post(url, json=payload, headers=_gpt_base_headers(authorization), timeout=30)
-        data  = resp.json()
-        token = data.get("conduit_token")
-        if token:
-            log.info("GPT: conduit_token fetched OK")
-        return token
-    except Exception as e:
-        log.warning("GPT: prepare failed: %s", e)
-        return None
-
-
-class GPTBackend(BaseBackend):
-    @property
-    def model_id(self) -> str:
-        return GPT_PROXY_ID
-
-    async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
-        if not token.startswith("Bearer ") and not token.startswith("bearer "):
-            authorization = f"Bearer {token}"
-        else:
-            authorization = token
-
-        cookie = extra.get("cookie", "")
-
-        await _evict_old_sessions()
-
-        last_user_msg = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                content = m.get("content", "")
-                if isinstance(content, list):
-                    content = " ".join(
-                        c.get("text", "") for c in content
-                        if isinstance(c, dict) and c.get("type") == "text"
-                    )
-                last_user_msg = content
-                break
-
-        if not last_user_msg:
-            last_user_msg = build_full_prompt(messages, [])
-
-        sess = await _get_session(token[:32], conv_id)
-
-        async with httpx.AsyncClient() as client:
-            if sess:
-                conversation_id = sess.get("gpt_conv_id")
-                parent_msg_id   = sess.get("gpt_parent_msg_id")
-                conduit_token   = sess.get("gpt_conduit_token")
-                log.info("GPT: reusing conv=%s", conversation_id)
-            else:
-                conversation_id = None
-                parent_msg_id   = None
-                conduit_token   = None
-
-            if not conduit_token:
-                conduit_token = await _gpt_prepare_conduit(authorization, client)
-                if conduit_token:
-                    await _set_session(token[:32], conv_id, {
-                        "gpt_conv_id": conversation_id,
-                        "gpt_parent_msg_id": parent_msg_id,
-                        "gpt_conduit_token": conduit_token,
-                    })
-
-            message_id = str(uuid.uuid4())
-            payload = {
-                "action": "next",
-                "messages": [{
-                    "id": message_id, "author": {"role": "user"},
-                    "content": {"parts": [last_user_msg], "content_type": "text"},
-                    "status": "finished_successfully", "recipient": "all",
-                    "metadata": {
-                        "model_slug": GPT_MODEL, "default_model_slug": GPT_MODEL,
-                        "is_visually_hidden_from_conversation": False,
-                        "exclude_after_next_user_message": False,
-                        "content_references": [], "search_result_groups": [],
-                        "search_queries": [], "image_results": [], "attachments": [],
-                        "system_hints": [], "dictation": False, "voice_mode_message": False,
-                        "image_gen_async": False, "trigger_async_ux": False, "writing_blocks": {},
-                    },
-                }],
-                "attachment_mime_types": [], "model": GPT_MODEL,
-                "history_and_training_disabled": False, "fork_from_shared_post": False,
-                "enable_message_followups": True, "force_use_sse": True,
-                "force_use_search": None, "force_paragen": False,
-                "supported_encodings": ["v1"], "supports_buffering": True,
-                "timezone": "Africa/Cairo", "timezone_offset_min": -180,
-                "system_hints": [], "is_onboarding_conversation": False,
-                "client_prepare_state": "success", "stream": True,
-            }
-
-            if conversation_id:
-                payload["conversation_id"] = conversation_id
-            if parent_msg_id:
-                payload["parent_message_id"] = parent_msg_id
-
-            req_device_id = str(uuid.uuid4())
-            headers = {
-                **_gpt_base_headers(authorization, req_device_id),
-                "Accept":                 "text/event-stream,application/json",
-                "cache-control":          "no-cache",
-                "x-sentinel-payload":     GPT_SENTINEL_PAYLOAD,
-                "x-oai-convo-session-id": str(uuid.uuid4()),
-                "x-oai-turn-trace-id":    str(uuid.uuid4()),
-                "x-openai-target-path":   "/backend-api/f/conversation",
-            }
-            if conduit_token:
-                headers["x-conduit-token"] = conduit_token
-            if cookie:
-                headers["Cookie"] = cookie
-
-            url           = f"{GPT_BASE_URL}/f/conversation"
-            full_text     = ""
-            new_conv_id   = conversation_id
-            new_parent_id = parent_msg_id
-
-            raw_lines_debug: List[str] = []
-
-            try:
-                async with client.stream("POST", url, json=payload,
-                                          headers=headers, timeout=REQUEST_TIMEOUT) as resp:
-                    log.info("GPT: HTTP status=%d", resp.status_code)
-
-                    async for raw_line in resp.aiter_lines():
-                        if not raw_line:
-                            continue
-
-                        if len(raw_lines_debug) < 30:
-                            raw_lines_debug.append(raw_line[:200])
-
-                        if not raw_line.startswith("data: "):
-                            continue
-                        ds = raw_line[6:].strip()
-                        if ds == "[DONE]":
-                            break
-
-                        try:
-                            obj = json.loads(ds)
-                        except json.JSONDecodeError:
-                            continue
-
-                        if obj.get("conversation_id"):
-                            new_conv_id = obj["conversation_id"]
-
-                        o_op = obj.get("o", "")
-                        p_op = obj.get("p", "")
-                        v_op = obj.get("v")
-
-                        if (o_op in ("append", "APPEND")
-                                and isinstance(v_op, str)
-                                and ("content/parts/0" in p_op or "parts/0" in p_op)):
-                            full_text += v_op
-                            continue
-
-                        if o_op in ("patch", "PATCH") and isinstance(v_op, list):
-                            for patch in v_op:
-                                po = patch.get("o", "")
-                                pp = patch.get("p", "")
-                                pv = patch.get("v")
-                                if (po in ("append", "APPEND")
-                                        and isinstance(pv, str)
-                                        and ("parts/0" in pp or "content" in pp)):
-                                    full_text += pv
-                            continue
-
-                        msg = obj.get("message") or {}
-                        if msg:
-                            if msg.get("id"):
-                                new_parent_id = msg["id"]
-                            msg_content = msg.get("content") or {}
-                            parts = msg_content.get("parts", [])
-                            if parts and isinstance(parts[0], str) and parts[0]:
-                                if not full_text:
-                                    full_text = parts[0]
-                            continue
-
-                        choices = obj.get("choices", [])
-                        if choices:
-                            delta   = choices[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                full_text += content
-                            continue
-
-                        if isinstance(v_op, str) and v_op and not p_op and not o_op:
-                            full_text += v_op
-
-            except Exception as e:
-                log.error("GPT stream error: %s", e)
-                yield sse_chunk(f"[GPT Error: {e}]", model=self.model_id)
-                yield sse_chunk(model=self.model_id, finish=True)
-                yield "data: [DONE]\n\n"
-                return
-
-        if raw_lines_debug:
-            log.info("GPT raw lines sample (first %d):", len(raw_lines_debug))
-            for i, line in enumerate(raw_lines_debug):
-                log.info("  [%02d] %s", i, line)
-
-        log.info("GPT: full_text=%d conv=%s parent=%s", len(full_text), new_conv_id, new_parent_id)
-
-        await _set_session(token[:32], conv_id, {
-            "gpt_conv_id":       new_conv_id,
-            "gpt_parent_msg_id": new_parent_id or message_id,
-            "gpt_conduit_token": conduit_token,
-        })
-
-        tc = parse_tool_call(full_text)
-        if tc:
-            call_id = f"call_{uuid.uuid4().hex[:24]}"
-            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
-            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
-            yield "data: [DONE]\n\n"
-        else:
-            txt = clean_text(full_text) or "[GPT: empty response — check server logs]"
-            for i in range(0, max(len(txt), 1), 40):
-                yield sse_chunk(txt[i:i+40], model=self.model_id)
-            yield sse_chunk(model=self.model_id, finish=True)
-            yield "data: [DONE]\n\n"
-
-
-register_backend(GPTBackend())
-
-
-# ══════════════════════════════════════════════════════════
-# BACKEND 5: Database (Supabase — Gemini / GPT / Claude)
+# BACKEND 4: Database (Supabase — Gemini / GPT / Claude)
 #
 # التوكن الثابت: "database-key"
-# الـ URL الفعلي ثابت داخل الكود، لا يحتاج توكن حقيقي.
-#
-# النماذج المدعومة (تُرسَل مباشرة كـ model في الـ payload):
-#   google/gemini-2.5-flash
-#   google/gemini-2.5-flash-lite
-#   google/gemini-2.5-pro
-#   openai/gpt-5-nano
-#   openai/gpt-5-mini
-#   openai/gpt-5
-#   anthropic/claude-3-5-haiku-20241022
-#   anthropic/claude-sonnet-4-5
-#   anthropic/claude-opus-4-1-20250805
-#   anthropic/claude-sonnet-5
-#   anthropic/claude-fable-5
 # ══════════════════════════════════════════════════════════
 
 DATABASE_FIXED_TOKEN = "database-key"
 DATABASE_URL         = "https://qcpujeurnkbvwlvmylyx.supabase.co/functions/v1/chat"
 DATABASE_TIMEOUT     = 180
 
-# النماذج المتاحة من الـ Database مع أسمائها المختصرة في البروكسي
 DATABASE_MODELS: Dict[str, str] = {
-    # اسم النموذج في البروكسي (model في OpenMinis) → اسمه الحقيقي عند الـ Supabase
     "db-gemini-flash":         "google/gemini-2.5-flash",
     "db-gemini-flash-lite":    "google/gemini-2.5-flash-lite",
     "db-gemini-pro":           "google/gemini-2.5-pro",
@@ -1055,39 +766,89 @@ DATABASE_MODELS: Dict[str, str] = {
     "db-claude-fable":         "anthropic/claude-fable-5",
 }
 
-# قائمة عكسية: الاسم الحقيقي → اسم البروكسي (للتعرف التلقائي)
 _DB_REAL_TO_PROXY: Dict[str, str] = {v: k for k, v in DATABASE_MODELS.items()}
 
 
 def _db_resolve_real_model(model_id: str) -> str:
-    """
-    يحوّل اسم النموذج من صيغة البروكسي إلى الاسم الحقيقي عند Supabase.
-    إذا أرسل المستخدم الاسم الحقيقي مباشرة (google/...) يُعيده كما هو.
-    """
-    # اسم بروكسي معروف
     if model_id in DATABASE_MODELS:
         return DATABASE_MODELS[model_id]
-    # اسم حقيقي مباشر (مثل google/gemini-2.5-flash)
     if "/" in model_id:
         return model_id
-    # افتراضي
     return "google/gemini-2.5-flash"
 
 
 def _db_is_database_token(token: str) -> bool:
-    """التحقق من أن التوكن هو توكن الـ Database وليس Qwen أو DeepSeek"""
     return token.strip() == DATABASE_FIXED_TOKEN
 
 
-class DatabaseBackend(BaseBackend):
+def _db_sanitize_messages(messages: List[Dict]) -> List[Dict]:
     """
-    Backend للـ Database (Supabase).
-    يقبل أي model_id يبدأ بـ "db-" أو الأسماء الحقيقية مباشرة.
-    يُرسل الرسائل كما هي (OpenAI format) إلى Supabase ويعيد الـ stream.
+    تنظيف الرسائل قبل إرسالها للـ Supabase:
+    - الاحتفاظ بـ role و content فقط
+    - تحويل content من list إلى string
+    - دمج system messages في أول رسالة user
     """
+    # استخراج system messages أولاً
+    system_texts = []
+    clean = []
 
+    for m in messages:
+        role    = m.get("role", "user")
+        content = m.get("content") or ""
+
+        # تحويل content من list إلى نص
+        if isinstance(content, list):
+            parts = []
+            for c in content:
+                if isinstance(c, dict):
+                    if c.get("type") == "text":
+                        parts.append(c.get("text", ""))
+                    elif c.get("type") == "image_url":
+                        parts.append("[IMAGE]")
+                elif isinstance(c, str):
+                    parts.append(c)
+            content = " ".join(parts).strip()
+
+        if role == "system":
+            if content:
+                system_texts.append(content)
+        elif role in ("user", "assistant"):
+            clean.append({"role": role, "content": str(content)})
+        # تجاهل tool/function messages
+
+    # دمج system في أول رسالة user
+    if system_texts and clean:
+        system_combined = "\n\n".join(system_texts)
+        first_user_idx = next((i for i, m in enumerate(clean) if m["role"] == "user"), None)
+        if first_user_idx is not None:
+            clean[first_user_idx]["content"] = (
+                f"[System: {system_combined}]\n\n{clean[first_user_idx]['content']}"
+            )
+    elif system_texts and not clean:
+        # إذا لم تكن هناك رسائل user، أضف system كـ user
+        clean.append({"role": "user", "content": "\n\n".join(system_texts)})
+
+    # ضمان تناوب user/assistant (Supabase قد يرفض رسالتين متتاليتين بنفس الـ role)
+    result = []
+    last_role = None
+    for m in clean:
+        if m["role"] == last_role:
+            # دمج مع السابق
+            result[-1]["content"] += "\n" + m["content"]
+        else:
+            result.append({"role": m["role"], "content": m["content"]})
+            last_role = m["role"]
+
+    # يجب أن تبدأ بـ user
+    if result and result[0]["role"] != "user":
+        result.insert(0, {"role": "user", "content": ""})
+
+    return result if result else [{"role": "user", "content": "Hello"}]
+
+
+class DatabaseBackend(BaseBackend):
     def __init__(self, proxy_id: str, real_model: str):
-        self._proxy_id  = proxy_id
+        self._proxy_id   = proxy_id
         self._real_model = real_model
 
     @property
@@ -1095,15 +856,16 @@ class DatabaseBackend(BaseBackend):
         return self._proxy_id
 
     async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
-        # تحديد الـ model الحقيقي
         real_model = _db_resolve_real_model(self._proxy_id)
 
-        log.info("Database: proxy_id=%s real_model=%s msgs=%d",
-                 self._proxy_id, real_model, len(messages))
+        # تنظيف الرسائل
+        clean_messages = _db_sanitize_messages(messages)
 
-        # بناء الـ payload — نفس صيغة الملف الثاني بالضبط
+        log.info("Database: proxy_id=%s real_model=%s msgs=%d (sanitized from %d)",
+                 self._proxy_id, real_model, len(clean_messages), len(messages))
+
         payload = {
-            "messages": messages,
+            "messages": clean_messages,
             "model":    real_model,
         }
 
@@ -1148,10 +910,8 @@ class DatabaseBackend(BaseBackend):
                                 delta   = choices[0].get("delta", {})
                                 content = delta.get("content")
                                 if content:
-                                    # تنظيف surrogates (كما في الملف الثاني)
                                     content = content.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
                                     full_text += content
-                                    # نبث مباشرة chunk بـ chunk
                                     yield sse_chunk(content, model=self._proxy_id)
                         except (json.JSONDecodeError, KeyError, IndexError):
                             continue
@@ -1172,7 +932,6 @@ class DatabaseBackend(BaseBackend):
         yield "data: [DONE]\n\n"
 
 
-# تسجيل كل نماذج الـ Database
 for _proxy_id, _real_model in DATABASE_MODELS.items():
     register_backend(DatabaseBackend(_proxy_id, _real_model))
 
@@ -1205,8 +964,6 @@ def resolve_extra(body: Dict, model: str) -> Dict:
         if se is None:
             se = body.get("search_enabled")
         extra["search_enabled"] = bool(se) if se is not None else True
-    elif model == GPT_PROXY_ID:
-        extra["cookie"] = extra_body.get("cookie") or body.get("cookie") or ""
     return extra
 
 
@@ -1244,7 +1001,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="8.0.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="8.1.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -1256,30 +1013,26 @@ def _extract_token(authorization: Optional[str]) -> str:
 
 
 def _is_database_model(model: str) -> bool:
-    """هل النموذج المطلوب ينتمي لـ Database backend؟"""
     return model in DATABASE_MODELS or model in _DB_REAL_TO_PROXY
 
 
 @app.get("/", tags=["health"])
 async def health():
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "8.0.0",
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "8.1.0",
         "active_sessions": len(_sessions), "backends": list(_BACKENDS.keys()),
         "models": {
-            # النماذج الأصلية
             "qwen":             "Qwen3.8-max via chat.qwen.ai",
             "deepseek":         "DeepSeek Expert via chat.deepseek.com",
             "deepseek-default": "DeepSeek Default (fast) via chat.deepseek.com",
-            "gpt":              "ChatGPT GPT-5 via android.chat.openai.com",
-            # Database
             **{pid: f"{rm} via Supabase Database" for pid, rm in DATABASE_MODELS.items()},
         },
         "database_token": DATABASE_FIXED_TOKEN,
         "notes": [
+            "v8.1: GPT backend removed",
+            "v8.1: Database messages sanitized before sending (fixes 400 errors)",
             "v8: Database backend added — Gemini, GPT-5, Claude via Supabase",
-            "v8: Database token is fixed: 'database-key' (no real auth needed)",
             "v7: conv_id is stable (anchored to first message)",
-            "v7: Two DeepSeek models: 'deepseek' (expert) and 'deepseek-default' (fast)",
         ],
     }
 
@@ -1288,23 +1041,20 @@ async def health():
 async def list_models():
     models = []
 
-    # النماذج الأصلية
-    for mid in ["qwen", "deepseek", "deepseek-default", "gpt"]:
+    for mid in ["qwen", "deepseek", "deepseek-default"]:
         if mid in _BACKENDS:
             models.append({
                 "id": mid, "object": "model",
                 "created": 1700000000, "owned_by": "proxy",
             })
 
-    # نماذج Qwen Vision
     models.append({
         "id": "qwen-vision", "object": "model",
         "created": 1700000000, "owned_by": "qwen",
     })
 
-    # نماذج Database
     for proxy_id, real_model in DATABASE_MODELS.items():
-        provider = real_model.split("/")[0]  # google / openai / anthropic
+        provider = real_model.split("/")[0]
         models.append({
             "id":         proxy_id,
             "object":     "model",
@@ -1321,21 +1071,15 @@ async def chat_completions(
     request:       Request,
     authorization: Optional[str] = Header(None),
 ):
-    token    = _extract_token(authorization)
-    body     = await request.json()
-    messages = body.get("messages", [])
-    tools    = body.get("tools", [])
+    token     = _extract_token(authorization)
+    body      = await request.json()
+    messages  = body.get("messages", [])
+    tools     = body.get("tools", [])
     do_stream = body.get("stream", False)
-    model    = body.get("model", QWEN_PROXY_ID)
+    model     = body.get("model", QWEN_PROXY_ID)
 
-    # ── توجيه التوكن حسب النموذج ──────────────────────────
-    if model == GPT_PROXY_ID:
-        effective_token = authorization or token
-    else:
-        effective_token = token
+    effective_token = token
 
-    # ── التحقق من توكن Database ───────────────────────────
-    # إذا كان النموذج db-* لكن التوكن غير صحيح → خطأ واضح
     if _is_database_model(model) and not _db_is_database_token(token):
         raise HTTPException(
             status_code=401,
@@ -1345,7 +1089,6 @@ async def chat_completions(
             ),
         )
 
-    # إذا كان التوكن هو database-key لكن النموذج ليس db-* → خطأ واضح
     if _db_is_database_token(token) and not _is_database_model(model):
         raise HTTPException(
             status_code=400,
@@ -1358,7 +1101,6 @@ async def chat_completions(
     thinking = resolve_thinking(body)
     extra    = resolve_extra(body, model)
 
-    # ── conv_id ثابت ──────────────────────────────────────
     explicit_conv_id = (
         body.get("conversation_id")
         or body.get("session_id")
@@ -1377,7 +1119,6 @@ async def chat_completions(
 
     backend = get_backend(model)
     if backend is None:
-        # محاولة الاسم الحقيقي → اسم البروكسي
         proxy_id = _DB_REAL_TO_PROXY.get(model)
         if proxy_id:
             backend = get_backend(proxy_id)
@@ -1392,7 +1133,6 @@ async def chat_completions(
                 yield chunk
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    # Non-streaming
     full_content   = ""
     finish_reason  = "stop"
     tool_call_data = None
@@ -1612,46 +1352,5 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v8.0 on port %d", port)
+    log.info("Starting Universal AI Proxy v8.1 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
-
-
-# ══════════════════════════════════════════════════════════
-# ملخص استخدام الـ API  (v8.0)
-# ══════════════════════════════════════════════════════════
-#
-# ① Qwen:
-#    POST /v1/chat/completions
-#    Authorization: Bearer <qwen_token>
-#    {"model": "qwen", "messages": [...]}
-#
-# ② DeepSeek Expert:
-#    Authorization: Bearer <deepseek_token>
-#    {"model": "deepseek", "messages": [...]}
-#
-# ③ DeepSeek Default:
-#    Authorization: Bearer <deepseek_token>
-#    {"model": "deepseek-default", "messages": [...]}
-#
-# ④ GPT:
-#    Authorization: Bearer eyJ...
-#    {"model": "gpt", "messages": [...]}
-#
-# ⑤ Database (جديد v8):
-#    Authorization: Bearer database-key
-#    {"model": "<proxy_id>", "messages": [...]}
-#
-#    النماذج المتاحة (proxy_id → النموذج الحقيقي):
-#      db-gemini-flash       → google/gemini-2.5-flash
-#      db-gemini-flash-lite  → google/gemini-2.5-flash-lite
-#      db-gemini-pro         → google/gemini-2.5-pro
-#      db-gpt-5-nano         → openai/gpt-5-nano
-#      db-gpt-5-mini         → openai/gpt-5-mini
-#      db-gpt-5              → openai/gpt-5
-#      db-claude-haiku       → anthropic/claude-3-5-haiku-20241022
-#      db-claude-sonnet      → anthropic/claude-sonnet-4-5
-#      db-claude-opus        → anthropic/claude-opus-4-1-20250805
-#      db-claude-sonnet-5    → anthropic/claude-sonnet-5
-#      db-claude-fable       → anthropic/claude-fable-5
-#
-# ══════════════════════════════════════════════════════════
