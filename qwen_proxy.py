@@ -1,14 +1,16 @@
 """
-Universal AI Proxy  v7.0
+Universal AI Proxy  v8.0
 =========================
-بروكسي موحد يدعم ثلاثة نماذج:
-  ① Qwen           — عبر chat.qwen.ai
+بروكسي موحد يدعم أربعة نماذج:
+  ① Qwen            — عبر chat.qwen.ai
   ② DeepSeek Expert — عبر chat.deepseek.com (model_type=expert)
   ③ DeepSeek Default— عبر chat.deepseek.com (model_type=default)
+  ④ Gemini          — عبر gemini.google.com  (cookies-based)
 
-إصلاحات v7.0:
-  • conv_id ثابت بناءً على أول رسالة في المحادثة (لا يتغير مع الرسائل الجديدة)
-  • نموذجان منفصلان لـ DeepSeek: "deepseek" (expert) و "deepseek-default"
+جديد v8.0:
+  • إضافة Gemini backend كاملاً (cookies + token management)
+  • كل نموذج له توكن/كوكيز خاص به — لا تتداخل
+  • conv_id ثابت لجميع النماذج
 """
 
 from __future__ import annotations
@@ -88,27 +90,15 @@ async def _evict_old_sessions() -> None:
 
 
 # ══════════════════════════════════════════════════════════
-# ★ conv_id ثابت — الحل الجوهري
-#
-# المشكلة: OpenMinis لا يرسل conversation_id ثابت،
-# فكنا نحسبه من الرسائل وهو يتغير مع كل رسالة جديدة.
-#
-# الحل: نحسب conv_id من أول رسالة فقط (anchor) فيبقى
-# ثابتاً طوال المحادثة بغض النظر عن عدد الرسائل.
+# conv_id ثابت
 # ══════════════════════════════════════════════════════════
 
 def _compute_conv_id(
     messages: List[Dict],
     explicit_id: Optional[str] = None,
 ) -> str:
-    """
-    إذا أرسل العميل conversation_id صريح → نستخدمه.
-    وإلا → نحسبه من أول رسالة فقط (لا تتغير).
-    """
     if explicit_id:
         return explicit_id
-
-    # أول رسالة في المحادثة = المرساة الثابتة
     anchor = messages[:1] if messages else [{"role": "user", "content": "init"}]
     raw    = json.dumps(anchor, ensure_ascii=False, sort_keys=True)
     return "conv_" + hashlib.md5(raw.encode()).hexdigest()
@@ -278,7 +268,6 @@ def parse_tool_call(text: str) -> Optional[Dict]:
     if m:
         return _make_tc(m.group(1), m.group(2))
 
-    # Branch 3: XML parameters style (من v6)
     m_name   = re.search(r"<name>(.*?)</name>", text, re.IGNORECASE)
     m_params = re.findall(
         r"<parameter[=:](\w+)>\s*(.*?)\s*</parameter>",
@@ -537,14 +526,7 @@ register_backend(QwenBackend())
 
 
 # ══════════════════════════════════════════════════════════
-# BACKEND 2 & 3: DeepSeek (Expert + Default)
-#
-# ★ الإصلاح الرئيسي: conv_id ثابت = لا نُنشئ جلسة جديدة
-#   إلا عند أول رسالة في المحادثة.
-#
-# ★ نموذجان:
-#   "deepseek"         → model_type=expert  (الافتراضي الأقوى)
-#   "deepseek-default" → model_type=default (السريع)
+# BACKEND 2 & 3: DeepSeek
 # ══════════════════════════════════════════════════════════
 
 DEEPSEEK_PROXY_ID_EXPERT  = "deepseek"
@@ -625,14 +607,8 @@ async def _ds_create_session(token: str, client: httpx.AsyncClient) -> str:
 
 
 class DeepSeekBackend(BaseBackend):
-    """
-    Backend عام لـ DeepSeek — يُنشئ نموذجين:
-      deepseek         → expert
-      deepseek-default → default
-    """
-
     def __init__(self, proxy_id: str, model_type: str):
-        self._proxy_id  = proxy_id
+        self._proxy_id   = proxy_id
         self._model_type = model_type
 
     @property
@@ -640,7 +616,6 @@ class DeepSeekBackend(BaseBackend):
         return self._proxy_id
 
     async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
-        # model_type: يمكن تجاوزه من extra لكن الافتراضي من النموذج نفسه
         model_type     = extra.get("model_type", self._model_type)
         search_enabled = extra.get("search_enabled", True)
 
@@ -650,7 +625,6 @@ class DeepSeekBackend(BaseBackend):
 
         await _evict_old_sessions()
 
-        # ★ الإصلاح: conv_id ثابت → نُنشئ جلسة DeepSeek مرة واحدة فقط
         sess = await _get_session(token, conv_id)
         async with httpx.AsyncClient() as client:
             if sess:
@@ -659,7 +633,6 @@ class DeepSeekBackend(BaseBackend):
                 log.info("DeepSeek[%s]: reusing session=%s parent=%s",
                          model_type, session_id, parent_message_id)
             else:
-                # أول مرة في هذه المحادثة → ننشئ جلسة واحدة
                 session_id        = await _ds_create_session(token, client)
                 parent_message_id = None
                 await _set_session(token, conv_id, {
@@ -741,7 +714,6 @@ class DeepSeekBackend(BaseBackend):
                 yield "data: [DONE]\n\n"
                 return
 
-        # حفظ parent_message_id الجديد للرسالة التالية
         if new_parent_msg_id:
             await _update_session(token, conv_id, ds_parent_msg_id=new_parent_msg_id)
 
@@ -766,9 +738,358 @@ class DeepSeekBackend(BaseBackend):
             yield "data: [DONE]\n\n"
 
 
-# تسجيل نموذجين DeepSeek
 register_backend(DeepSeekBackend(DEEPSEEK_PROXY_ID_EXPERT,  "expert"))
 register_backend(DeepSeekBackend(DEEPSEEK_PROXY_ID_DEFAULT, "default"))
+
+
+# ══════════════════════════════════════════════════════════
+# BACKEND 4: Gemini
+#
+# التوكن هنا = سلسلة كوكيز كاملة بصيغة:
+#   "KEY1=VAL1; KEY2=VAL2; ..."
+#
+# أو يمكن إرساله كـ JSON object محوّل إلى string.
+#
+# الـ USER_ACCOUNT و BL مضمّنان هنا — لا تحتاج تغييرهم
+# إلا إذا تغيّرت نسخة Gemini.
+# ══════════════════════════════════════════════════════════
+
+GEMINI_PROXY_ID   = "gemini"
+GEMINI_USER_ACCT  = "u/1"
+GEMINI_BL         = "boq_assistant-bard-web-server_20260817.02_p0"
+GEMINI_MODEL_JSPB = (
+    '[1,null,null,null,"fbb127bbb056c959",null,null,0,'
+    '[4,5,6,8,4,5,6,8],null,null,1,null,null,1,1,'
+    '"036033AF-386B-4A1C-A8B6-F563586CF2B9"]'
+)
+GEMINI_BASE_URL = (
+    f"https://gemini.google.com/{GEMINI_USER_ACCT}/_/BardChatUi/data"
+)
+GEMINI_APP_URL  = f"https://gemini.google.com/{GEMINI_USER_ACCT}/app"
+GEMINI_STREAM_URL = (
+    f"{GEMINI_BASE_URL}/assistant.lamda.BardFrontendService/StreamGenerate"
+)
+
+# الكوكيز التي نتابع تحديثها تلقائياً من ردود الخادم
+GEMINI_TRACKED_COOKIES = {
+    "SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC",
+    "__Secure-1PSIDTS", "__Secure-3PSIDTS",
+    "COMPASS", "_gcl_au", "_ga_WC57KJ50ZZ", "_ga_BF8Q35BMLM",
+}
+
+# مخزن كوكيز Gemini — مفصول تماماً عن sessions النماذج الأخرى
+# المفتاح: أول 64 حرف من cookie_string
+_gemini_cookie_store: Dict[str, Dict[str, str]] = {}
+_gemini_lock = asyncio.Lock()
+
+
+def _parse_cookie_string(cookie_str: str) -> Dict[str, str]:
+    """تحويل 'K1=V1; K2=V2' إلى dict"""
+    result: Dict[str, str] = {}
+    for part in cookie_str.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            result[k.strip()] = v.strip()
+    return result
+
+
+def _cookies_to_string(cookies: Dict[str, str]) -> str:
+    return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+
+def _gemini_cookie_key(cookie_str: str) -> str:
+    """مفتاح فريد لمخزن الكوكيز بناءً على SID"""
+    cookies = _parse_cookie_string(cookie_str)
+    # نستخدم أول 32 حرف من SID كمعرف
+    sid = cookies.get("SID", cookie_str)
+    return "gem_" + hashlib.md5(sid[:64].encode()).hexdigest()[:16]
+
+
+async def _gemini_get_cookies(cookie_key: str, initial_str: str) -> Dict[str, str]:
+    """إرجاع الكوكيز المحدّثة من المخزن، أو تحليل initial_str"""
+    async with _gemini_lock:
+        if cookie_key in _gemini_cookie_store:
+            return dict(_gemini_cookie_store[cookie_key])
+        # أول استخدام — نحلل الـ string المُرسَل
+        parsed = _parse_cookie_string(initial_str)
+        _gemini_cookie_store[cookie_key] = parsed
+        return dict(parsed)
+
+
+async def _gemini_update_cookies(cookie_key: str, response_cookies) -> None:
+    """تحديث الكوكيز المتغيرة من رد الخادم"""
+    async with _gemini_lock:
+        if cookie_key not in _gemini_cookie_store:
+            return
+        updated = []
+        for cookie in response_cookies:
+            if cookie.name in GEMINI_TRACKED_COOKIES:
+                old = _gemini_cookie_store[cookie_key].get(cookie.name, "")
+                if old != cookie.value:
+                    _gemini_cookie_store[cookie_key][cookie.name] = cookie.value
+                    updated.append(cookie.name)
+        if updated:
+            log.info("Gemini: cookies updated: %s", ", ".join(updated))
+
+
+def _gemini_headers(cookies_str: str) -> Dict[str, str]:
+    return {
+        "authority":        "gemini.google.com",
+        "accept":           "*/*",
+        "accept-language":  "ar,en-US;q=0.9,en;q=0.8",
+        "origin":           "https://gemini.google.com",
+        "referer":          "https://gemini.google.com/",
+        "user-agent":       (
+            "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/109.0.0.0 Mobile Safari/537.36"
+        ),
+        "x-same-domain":    "1",
+        "content-type":     "application/x-www-form-urlencoded;charset=UTF-8",
+        "cookie":           cookies_str,
+    }
+
+
+async def _gemini_get_tokens(
+    cookies: Dict[str, str],
+    client: httpx.AsyncClient,
+    cookie_key: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """جلب SNlM0e و FdrFJe من صفحة التطبيق"""
+    cookies_str = _cookies_to_string(cookies)
+    try:
+        resp = await client.get(
+            GEMINI_APP_URL,
+            headers=_gemini_headers(cookies_str),
+            timeout=30,
+            follow_redirects=True,
+        )
+        # تحديث الكوكيز
+        await _gemini_update_cookies(cookie_key, resp.cookies)
+
+        snlm0e = None
+        fdrfje = None
+        q1 = re.search(r'"SNlM0e":"(.*?)"', resp.text)
+        if q1:
+            snlm0e = q1.group(1)
+        q2 = re.search(r'"FdrFJe":"([\d-]+)"', resp.text)
+        if q2:
+            fdrfje = q2.group(1)
+        return snlm0e, fdrfje
+    except Exception as e:
+        log.error("Gemini: failed to get tokens: %s", e)
+        return None, None
+
+
+async def _gemini_send_message(
+    cookies: Dict[str, str],
+    client:  httpx.AsyncClient,
+    cookie_key: str,
+    prompt:  str,
+    snlm0e:  str,
+    fdrfje:  str,
+    gemini_conv: Optional[Dict],
+) -> Tuple[str, Optional[Dict]]:
+    """إرسال رسالة لـ Gemini وإرجاع (full_text, updated_gemini_conv)"""
+
+    # بناء context المحادثة
+    if gemini_conv is None:
+        context = ["", "", "", None, None, None, None, None, None, ""]
+    else:
+        context = [
+            gemini_conv.get("conversation_id", ""),
+            gemini_conv.get("response_id", ""),
+            gemini_conv.get("choice_id", ""),
+            None, None, None, None, None, None,
+            gemini_conv.get("at_token", ""),
+        ]
+
+    d1 = [
+        [prompt, 0, None, None, None, None, 0],
+        ["ar"],
+        context,
+        None, None, None, [], 0, [], [], 1, 0,
+    ]
+
+    payload = {
+        "at":    snlm0e,
+        "f.req": json.dumps([None, json.dumps(d1)]),
+    }
+
+    params = {
+        "bl":     GEMINI_BL,
+        "hl":     "ar",
+        "pageId": "none",
+        "_reqid": str(__import__("random").randint(1_000_000, 9_999_999)),
+        "rt":     "c",
+        "f.sid":  fdrfje,
+    }
+
+    cookies_str = _cookies_to_string(cookies)
+    h2 = _gemini_headers(cookies_str)
+    h2["x-goog-ext-525001261-jspb"] = GEMINI_MODEL_JSPB
+    h2["x-goog-ext-73010989-jspb"]  = "[0]"
+    h2["x-goog-ext-73010990-jspb"]  = "[0,0,0]"
+
+    full_text      = ""
+    new_conv       = dict(gemini_conv) if gemini_conv else {}
+    new_at_token   = None
+
+    try:
+        async with client.stream(
+            "POST", GEMINI_STREAM_URL,
+            params=params, data=payload,
+            headers=h2, timeout=REQUEST_TIMEOUT,
+        ) as resp:
+            await _gemini_update_cookies(cookie_key, resp.cookies)
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                try:
+                    a1 = json.loads(line)
+                    if not isinstance(a1, list) or not a1:
+                        continue
+                    if len(a1[0]) >= 3 and a1[0][2]:
+                        c2 = json.loads(a1[0][2])
+                        # conversation_id / response_id
+                        try:
+                            if not new_conv.get("conversation_id"):
+                                conv_meta = c2[1]
+                                if conv_meta and len(conv_meta) >= 2:
+                                    new_conv["conversation_id"] = conv_meta[0]
+                                    new_conv["response_id"]     = conv_meta[1]
+                        except Exception:
+                            pass
+                        # choice_id + نص الرد
+                        try:
+                            candidates = c2[4]
+                            if candidates and candidates[0]:
+                                choice = candidates[0]
+                                if choice[0]:
+                                    new_conv["choice_id"] = choice[0]
+                                text = choice[1][0]
+                                if text and text.startswith(full_text):
+                                    new_part = text[len(full_text):]
+                                    if new_part:
+                                        full_text = text
+                        except Exception:
+                            pass
+                        # at_token
+                        try:
+                            if isinstance(c2[3], dict):
+                                at_val = c2[3].get("26", "")
+                                if at_val:
+                                    new_at_token = at_val
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+    except Exception as e:
+        log.error("Gemini stream error: %s", e)
+        return f"[Gemini Error: {e}]", gemini_conv
+
+    if new_at_token:
+        new_conv["at_token"] = new_at_token
+
+    return full_text, new_conv if new_conv.get("conversation_id") else None
+
+
+class GeminiBackend(BaseBackend):
+    """
+    Backend يتحدث مع Gemini عبر كوكيز.
+
+    التوكن = سلسلة كوكيز كاملة (نفس ما يُرسَل كـ Cookie header)
+    مثال:
+        Authorization: Bearer "_ga=GA1....; SID=g.a000...; ..."
+
+    أو يمكن وضعها في ملف إعدادات وإرسال مفتاح فقط —
+    لكن الطريقة الأبسط هي إرسال الكوكيز كاملة كـ token.
+
+    المحادثة تحتفظ بـ:
+        - gemini_snlm0e  : يُجلب مرة واحدة لكل conv
+        - gemini_fdrfje  : يُجلب مرة واحدة لكل conv
+        - gemini_conv    : conversation_id, response_id, choice_id, at_token
+        - gemini_ck      : مفتاح مخزن الكوكيز
+    """
+
+    @property
+    def model_id(self) -> str:
+        return GEMINI_PROXY_ID
+
+    async def complete(
+        self, token, messages, tools, thinking, conv_id, extra
+    ) -> AsyncIterator[str]:
+
+        # ── استخراج prompt ──────────────────────────────────────────
+        prompt = build_full_prompt(messages, tools)
+        if not prompt.strip():
+            return
+
+        await _evict_old_sessions()
+
+        # ── مفتاح الكوكيز ───────────────────────────────────────────
+        cookie_key = _gemini_cookie_key(token)
+
+        # ── جلب الجلسة أو إنشاؤها ───────────────────────────────────
+        sess = await _get_session(token, conv_id)
+
+        async with httpx.AsyncClient(verify=False) as client:
+            if sess and sess.get("gemini_snlm0e"):
+                snlm0e    = sess["gemini_snlm0e"]
+                fdrfje    = sess["gemini_fdrfje"]
+                gemini_conv = sess.get("gemini_conv")
+                log.info("Gemini: reusing session conv=%s", conv_id)
+            else:
+                # أول رسالة — نجلب التوكنات
+                cookies = await _gemini_get_cookies(cookie_key, token)
+                snlm0e, fdrfje = await _gemini_get_tokens(cookies, client, cookie_key)
+
+                if not snlm0e:
+                    err_msg = "[Gemini Error: failed to get session tokens — check cookies]"
+                    log.error(err_msg)
+                    yield sse_chunk(err_msg, model=self.model_id)
+                    yield sse_chunk(model=self.model_id, finish=True)
+                    yield "data: [DONE]\n\n"
+                    return
+
+                gemini_conv = None
+                await _set_session(token, conv_id, {
+                    "gemini_snlm0e": snlm0e,
+                    "gemini_fdrfje": fdrfje,
+                    "gemini_conv":   gemini_conv,
+                    "gemini_ck":     cookie_key,
+                })
+                log.info("Gemini: new session conv=%s snlm0e=%s", conv_id, snlm0e[:8])
+
+            # ── إرسال الرسالة ────────────────────────────────────────
+            cookies = await _gemini_get_cookies(cookie_key, token)
+            full_text, updated_conv = await _gemini_send_message(
+                cookies, client, cookie_key,
+                prompt, snlm0e, fdrfje, gemini_conv,
+            )
+
+        # ── تحديث الجلسة ─────────────────────────────────────────────
+        await _update_session(token, conv_id, gemini_conv=updated_conv)
+
+        log.info("Gemini: text=%d chars", len(full_text))
+
+        # ── بث الرد بصيغة OpenAI ─────────────────────────────────────
+        tc = parse_tool_call(full_text)
+        if tc:
+            call_id = f"call_{uuid.uuid4().hex[:24]}"
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id)
+            yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
+            yield "data: [DONE]\n\n"
+        else:
+            txt = clean_text(full_text) or "[Gemini: empty response]"
+            for i in range(0, max(len(txt), 1), 40):
+                yield sse_chunk(txt[i:i+40], model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+
+
+register_backend(GeminiBackend())
 
 
 # ══════════════════════════════════════════════════════════
@@ -793,7 +1114,6 @@ def resolve_extra(body: Dict, model: str) -> Dict:
     if model in (DEEPSEEK_PROXY_ID_EXPERT, DEEPSEEK_PROXY_ID_DEFAULT):
         mt = extra_body.get("model_type") or body.get("model_type")
         if not mt:
-            # نستخدم model_type المرتبط بالنموذج نفسه
             mt = "expert" if model == DEEPSEEK_PROXY_ID_EXPERT else "default"
         extra["model_type"] = mt if mt in ("default", "expert") else "expert"
         se = extra_body.get("search_enabled")
@@ -837,7 +1157,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="7.0.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="8.0.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -851,16 +1171,20 @@ def _extract_token(authorization: Optional[str]) -> str:
 @app.get("/", tags=["health"])
 async def health():
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "7.0.0",
-        "active_sessions": len(_sessions), "backends": list(_BACKENDS.keys()),
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "8.0.0",
+        "active_sessions": len(_sessions),
+        "gemini_cookie_keys": len(_gemini_cookie_store),
+        "backends": list(_BACKENDS.keys()),
         "models": {
             "qwen":             "Qwen3.8-max via chat.qwen.ai",
             "deepseek":         "DeepSeek Expert via chat.deepseek.com",
             "deepseek-default": "DeepSeek Default (fast) via chat.deepseek.com",
+            "gemini":           "Gemini via gemini.google.com (cookies-based)",
         },
         "notes": [
-            "v7: conv_id is now stable (anchored to first message) — no more new DS sessions per turn",
-            "v7: Two DeepSeek models: 'deepseek' (expert) and 'deepseek-default' (fast)",
+            "v8: Gemini backend added — send cookies string as Bearer token",
+            "v8: Each model uses its own token/cookies — no cross-contamination",
+            "v7: conv_id anchored to first message (stable across turns)",
         ],
     }
 
@@ -890,7 +1214,6 @@ async def chat_completions(
     thinking = resolve_thinking(body)
     extra    = resolve_extra(body, model)
 
-    # ★ conv_id ثابت — الإصلاح الرئيسي
     explicit_conv_id = (
         body.get("conversation_id")
         or body.get("session_id")
@@ -1139,51 +1462,36 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v7.0 on port %d", port)
+    log.info("Starting Universal AI Proxy v8.0 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
 
 
 # ══════════════════════════════════════════════════════════
-# ملخص استخدام الـ API  (v7.0)
+# ملخص الاستخدام v8.0
 # ══════════════════════════════════════════════════════════
 #
 # ① Qwen:
-#    POST /v1/chat/completions
 #    Authorization: Bearer <qwen_token>
-#    {"model": "qwen", "messages": [...], "thinking": true/false}
+#    {"model": "qwen", "messages": [...]}
 #
-# ② DeepSeek Expert (الأقوى):
-#    POST /v1/chat/completions
+# ② DeepSeek Expert:
 #    Authorization: Bearer <deepseek_token>
-#    {
-#      "model": "deepseek",
-#      "messages": [...],
-#      "thinking": true/false,
-#      "extra_body": {
-#        "search_enabled": true       // أو false
-#      }
-#    }
+#    {"model": "deepseek", "messages": [...]}
 #
-# ③ DeepSeek Default (السريع):
-#    POST /v1/chat/completions
+# ③ DeepSeek Default:
 #    Authorization: Bearer <deepseek_token>
-#    {
-#      "model": "deepseek-default",
-#      "messages": [...],
-#      "thinking": false,
-#      "extra_body": {
-#        "search_enabled": true       // أو false
-#      }
-#    }
-#    - في OpenMinis: أضف نموذجين بنفس التوكن، model يتغير فقط
-#    - thinking chunk منفصل: data: {"type":"thinking","content":"..."}
-#    - باقي الرد بصيغة OpenAI العادية
+#    {"model": "deepseek-default", "messages": [...]}
 #
-# ══════════════════════════════════════════════════════════
-# ملاحظات v7 الجديدة:
-#   • conv_id مرتكز على أول رسالة فقط (ثابت طوال المحادثة)
-#   • لا تُنشأ جلسة DeepSeek جديدة مع كل رسالة
-#   • نموذجان لـ DeepSeek في OpenMinis:
-#     - "deepseek"         → Expert  (أبطأ، أقوى)
-#     - "deepseek-default" → Default (أسرع، خفيف)
+# ④ Gemini:
+#    Authorization: Bearer "_ga=GA1....; SID=g.a000...; __Secure-1PSID=..."
+#    {"model": "gemini", "messages": [...]}
+#
+#    الـ token لـ Gemini = الكوكيز كاملة بصيغة string واحدة
+#    (نفس ما يظهر في INITIAL_COOKIES بعد دمجه بـ "; ")
+#
+#    الكوكيز المتغيرة (SIDCC وما يشبهها) تُحدَّث تلقائياً
+#    في الذاكرة مع كل رد — لا تحتاج تحديثها يدوياً.
+#
+#    إذا انتهت صلاحية الكوكيز → أرسل الكوكيز الجديدة كـ token
+#    وسيبدأ البروكسي جلسة جديدة تلقائياً.
 # ══════════════════════════════════════════════════════════
