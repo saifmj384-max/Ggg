@@ -818,17 +818,26 @@ async def _gemini_get_cookies(cookie_key: str, initial_str: str) -> Dict[str, st
 
 
 async def _gemini_update_cookies(cookie_key: str, response_cookies) -> None:
-    """تحديث الكوكيز المتغيرة من رد الخادم"""
+    """تحديث الكوكيز المتغيرة من رد الخادم.
+    
+    httpx.Cookies لا تُرجع objects عند التكرار — تُرجع strings (أسماء).
+    لذا نستخدم .items() للحصول على (name, value) معاً.
+    """
     async with _gemini_lock:
         if cookie_key not in _gemini_cookie_store:
             return
         updated = []
-        for cookie in response_cookies:
-            if cookie.name in GEMINI_TRACKED_COOKIES:
-                old = _gemini_cookie_store[cookie_key].get(cookie.name, "")
-                if old != cookie.value:
-                    _gemini_cookie_store[cookie_key][cookie.name] = cookie.value
-                    updated.append(cookie.name)
+        try:
+            # httpx.Cookies.items() يُرجع (name, value) tuples
+            items = list(response_cookies.items())
+        except Exception:
+            return
+        for name, value in items:
+            if name in GEMINI_TRACKED_COOKIES:
+                old = _gemini_cookie_store[cookie_key].get(name, "")
+                if old != value:
+                    _gemini_cookie_store[cookie_key][name] = value
+                    updated.append(name)
         if updated:
             log.info("Gemini: cookies updated: %s", ", ".join(updated))
 
@@ -856,29 +865,85 @@ async def _gemini_get_tokens(
     client: httpx.AsyncClient,
     cookie_key: str,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """جلب SNlM0e و FdrFJe من صفحة التطبيق"""
+    """جلب SNlM0e و FdrFJe من صفحة التطبيق.
+    
+    إصلاحات:
+    - نمرر الكوكيز عبر headers مباشرة (لا عبر httpx cookies= لأن Gemini
+      يتطلب الكوكيز بصيغة محددة في الـ Cookie header)
+    - نتتبع الـ redirects يدوياً لضمان إرسال الكوكيز مع كل طلب
+    - نسجّل status_code وطول الرد للتشخيص
+    """
     cookies_str = _cookies_to_string(cookies)
+    headers = _gemini_headers(cookies_str)
+    # نحذف Content-Type من طلب GET
+    headers.pop("content-type", None)
+
     try:
-        resp = await client.get(
-            GEMINI_APP_URL,
-            headers=_gemini_headers(cookies_str),
-            timeout=30,
-            follow_redirects=True,
-        )
-        # تحديث الكوكيز
+        # نتتبع الـ redirects يدوياً لضمان إرسال الكوكيز في كل redirect
+        url = GEMINI_APP_URL
+        for _ in range(5):  # حد أقصى 5 redirects
+            resp = await client.get(
+                url,
+                headers=headers,
+                timeout=30,
+                follow_redirects=False,
+            )
+            log.info("Gemini token fetch: status=%d url=%s body_len=%d",
+                     resp.status_code, url, len(resp.text))
+
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("location", "")
+                if not location:
+                    break
+                # نُحوّل relative URL إلى absolute
+                if location.startswith("/"):
+                    location = "https://gemini.google.com" + location
+                url = location
+                # تحديث الكوكيز من الـ redirect response
+                await _gemini_update_cookies(cookie_key, resp.cookies)
+                log.info("Gemini: redirect → %s", url[:80])
+                continue
+            break
+
+        # تحديث الكوكيز من الرد النهائي
         await _gemini_update_cookies(cookie_key, resp.cookies)
 
         snlm0e = None
         fdrfje = None
-        q1 = re.search(r'"SNlM0e":"(.*?)"', resp.text)
-        if q1:
-            snlm0e = q1.group(1)
-        q2 = re.search(r'"FdrFJe":"([\d-]+)"', resp.text)
-        if q2:
-            fdrfje = q2.group(1)
+
+        # نجرب regex patterns متعددة لاستخراج SNlM0e
+        for pattern in [
+            r'"SNlM0e":"(.*?)"',
+            r"'SNlM0e':'(.*?)'",
+            r'SNlM0e["\s]*:["\s]*"([^"]+)"',
+        ]:
+            q1 = re.search(pattern, resp.text)
+            if q1:
+                snlm0e = q1.group(1)
+                break
+
+        for pattern in [
+            r'"FdrFJe":"([\d-]+)"',
+            r"'FdrFJe':'([\d-]+)'",
+            r'FdrFJe["\s]*:["\s]*"([\d-]+)"',
+        ]:
+            q2 = re.search(pattern, resp.text)
+            if q2:
+                fdrfje = q2.group(1)
+                break
+
+        if not snlm0e:
+            # سجّل أول 500 حرف من الرد للتشخيص
+            log.error("Gemini: SNlM0e not found. Response preview: %s",
+                      resp.text[:500].replace("\n", " "))
+        else:
+            log.info("Gemini: tokens OK snlm0e=%s fdrfje=%s",
+                     snlm0e[:8], fdrfje)
+
         return snlm0e, fdrfje
+
     except Exception as e:
-        log.error("Gemini: failed to get tokens: %s", e)
+        log.error("Gemini: failed to get tokens: %s", e, exc_info=True)
         return None, None
 
 
@@ -1034,15 +1099,18 @@ class GeminiBackend(BaseBackend):
         # ── جلب الجلسة أو إنشاؤها ───────────────────────────────────
         sess = await _get_session(token, conv_id)
 
-        async with httpx.AsyncClient(verify=False) as client:
+        async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as client:
             if sess and sess.get("gemini_snlm0e"):
                 snlm0e    = sess["gemini_snlm0e"]
                 fdrfje    = sess["gemini_fdrfje"]
                 gemini_conv = sess.get("gemini_conv")
-                log.info("Gemini: reusing session conv=%s", conv_id)
+                log.info("Gemini: reusing session conv=%s snlm0e=%s",
+                         conv_id, snlm0e[:8] if snlm0e else "?")
             else:
                 # أول رسالة — نجلب التوكنات
+                # نتأكد أن cookie_key موجود في المخزن أولاً
                 cookies = await _gemini_get_cookies(cookie_key, token)
+                log.info("Gemini: fetching tokens, cookies=%d keys", len(cookies))
                 snlm0e, fdrfje = await _gemini_get_tokens(cookies, client, cookie_key)
 
                 if not snlm0e:
@@ -1062,8 +1130,11 @@ class GeminiBackend(BaseBackend):
                 })
                 log.info("Gemini: new session conv=%s snlm0e=%s", conv_id, snlm0e[:8])
 
-            # ── إرسال الرسالة ────────────────────────────────────────
+            # ── إرسال الرسالة (نجلب الكوكيز المحدّثة من المخزن) ────────
+            # المخزن قد يحتوي كوكيز محدّثة من استدعاء get_tokens
             cookies = await _gemini_get_cookies(cookie_key, token)
+            log.info("Gemini: sending message, conv_id=%s cookies=%d",
+                     conv_id, len(cookies))
             full_text, updated_conv = await _gemini_send_message(
                 cookies, client, cookie_key,
                 prompt, snlm0e, fdrfje, gemini_conv,
