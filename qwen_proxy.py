@@ -1,16 +1,15 @@
-"""
-Universal AI Proxy  v8.0
+"""Universal AI Proxy  v9.0
 =========================
-بروكسي موحد يدعم أربعة نماذج:
-  ① Qwen            — عبر chat.qwen.ai
-  ② DeepSeek Expert — عبر chat.deepseek.com (model_type=expert)
-  ③ DeepSeek Default— عبر chat.deepseek.com (model_type=default)
-  ④ Gemini          — عبر gemini.google.com  (cookies-based)
-
-جديد v8.0:
-  • إضافة Gemini backend كاملاً (cookies + token management)
-  • كل نموذج له توكن/كوكيز خاص به — لا تتداخل
-  • conv_id ثابت لجميع النماذج
+التحسينات الجديدة:
+  ① DeepSeek: Fallback تلقائي عند خطأ "الخادم مشغول"
+      - محاولة أولى: محادثة جديدة بنفس الوضع
+      - محاولة ثانية: تغيير الوضع (expert↔default) + محادثة جديدة
+  ② Regenerate: كشف طلب regenerate → إنشاء محادثة جديدة لكل النماذج
+  ③ Qwen Proxy: نظام proxy ذكي
+      - يستخدم proxy فقط لـ Qwen
+      - ينتقل للبروكسي التالي فقط عند HTTP 403/429 (حظر)
+      - يحتفظ بنفس البروكسي لنفس المحادثة (session sticky)
+      - لا ينتقل عند أخطاء الشبكة العادية
 """
 
 from __future__ import annotations
@@ -43,6 +42,105 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
 log = logging.getLogger("ai_proxy")
+
+
+# ══════════════════════════════════════════════════════════
+# Proxy Manager (Qwen فقط)
+# ══════════════════════════════════════════════════════════
+
+PROXY_FILE = os.environ.get("PROXY_FILE", "proxies.txt")
+
+class QwenProxyManager:
+    """
+    يدير قائمة البروكسيات لـ Qwen.
+    - sticky per session: نفس المحادثة تستخدم نفس البروكسي
+    - يتبدل فقط عند HTTP 403/429 (حظر IP)
+    - يسجّل البروكسيات المحظورة ويتجنبها
+    """
+
+    def __init__(self):
+        self._proxies: List[str] = []      # "http://user:pass@host:port"
+        self._banned: set = set()           # proxies محظورة
+        self._idx = 0                       # index الحالي (round-robin أولي)
+        self._lock = asyncio.Lock()
+        self._session_proxy: Dict[str, str] = {}  # conv_id → proxy_url
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(PROXY_FILE):
+            log.warning("Proxy file '%s' not found — Qwen will run without proxy", PROXY_FILE)
+            return
+        with open(PROXY_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                # صيغة: user:pass@host:port  أو  http://user:pass@host:port
+                if not line.startswith("http"):
+                    line = "http://" + line
+                self._proxies.append(line)
+        log.info("ProxyManager: loaded %d proxies from %s", len(self._proxies), PROXY_FILE)
+
+    @property
+    def enabled(self) -> bool:
+        return len(self._proxies) > 0
+
+    def _available(self) -> List[str]:
+        return [p for p in self._proxies if p not in self._banned]
+
+    async def get_for_session(self, conv_id: str) -> Optional[str]:
+        """إرجاع البروكسي المخصص للمحادثة، أو تعيين واحد جديد"""
+        async with self._lock:
+            if not self._proxies:
+                return None
+            avail = self._available()
+            if not avail:
+                log.warning("ProxyManager: all proxies banned! resetting ban list")
+                self._banned.clear()
+                avail = self._proxies[:]
+
+            if conv_id in self._session_proxy:
+                p = self._session_proxy[conv_id]
+                if p in avail:
+                    return p
+                # البروكسي القديم محظور → نعيّن جديد
+                log.info("ProxyManager: session %s proxy was banned, reassigning", conv_id[:16])
+
+            # اختيار round-robin من المتاح
+            p = avail[self._idx % len(avail)]
+            self._idx += 1
+            self._session_proxy[conv_id] = p
+            return p
+
+    async def mark_banned(self, proxy_url: str, conv_id: str) -> Optional[str]:
+        """
+        يُعلّم البروكسي كمحظور ويُعيّن بروكسي جديد للمحادثة.
+        يُستدعى فقط عند HTTP 403/429 من Qwen.
+        """
+        async with self._lock:
+            if proxy_url in self._proxies:
+                self._banned.add(proxy_url)
+                log.warning("ProxyManager: banned proxy %s (total banned: %d/%d)",
+                            proxy_url, len(self._banned), len(self._proxies))
+            avail = self._available()
+            if not avail:
+                log.warning("ProxyManager: no available proxies! resetting")
+                self._banned.clear()
+                avail = self._proxies[:]
+            if not avail:
+                return None
+            p = avail[self._idx % len(avail)]
+            self._idx += 1
+            self._session_proxy[conv_id] = p
+            log.info("ProxyManager: conv %s switched to proxy %s",
+                     conv_id[:16], p.split('@')[-1])
+            return p
+
+    def get_httpx_proxies(self, proxy_url: str) -> Dict[str, str]:
+        return {"http://": proxy_url, "https://": proxy_url}
+
+
+proxy_manager = QwenProxyManager()
 
 
 # ══════════════════════════════════════════════════════════
@@ -79,6 +177,15 @@ async def _update_session(token: str, conv_id: str, **kwargs) -> None:
             _sessions[key]["last_used"] = time.time()
 
 
+async def _clear_session(token: str, conv_id: str) -> None:
+    """حذف الجلسة لإجبار إنشاء محادثة جديدة"""
+    async with _session_lock:
+        key = _session_key(token, conv_id)
+        if key in _sessions:
+            del _sessions[key]
+            log.info("Session cleared: %s", conv_id[:16])
+
+
 async def _evict_old_sessions() -> None:
     async with _session_lock:
         now   = time.time()
@@ -102,6 +209,24 @@ def _compute_conv_id(
     anchor = messages[:1] if messages else [{"role": "user", "content": "init"}]
     raw    = json.dumps(anchor, ensure_ascii=False, sort_keys=True)
     return "conv_" + hashlib.md5(raw.encode()).hexdigest()
+
+
+def _is_regenerate_request(body: Dict) -> bool:
+    """
+    كشف إذا كان الطلب regenerate.
+    Open Minis يرسل عادةً:
+      - "regenerate": true
+      - أو "action": "regenerate"
+      - أو "resend": true
+    """
+    if body.get("regenerate") or body.get("resend"):
+        return True
+    if body.get("action") in ("regenerate", "resend", "retry"):
+        return True
+    extra = body.get("extra_body") or {}
+    if extra.get("regenerate") or extra.get("action") in ("regenerate", "resend"):
+        return True
+    return False
 
 
 # ══════════════════════════════════════════════════════════
@@ -267,7 +392,6 @@ def parse_tool_call(text: str) -> Optional[Dict]:
     )
     if m:
         return _make_tc(m.group(1), m.group(2))
-
     m_name   = re.search(r"<name>(.*?)</name>", text, re.IGNORECASE)
     m_params = re.findall(
         r"<parameter[=:](\w+)>\s*(.*?)\s*</parameter>",
@@ -276,7 +400,6 @@ def parse_tool_call(text: str) -> Optional[Dict]:
     if m_name and m_params:
         params = {p: v for p, v in m_params}
         return _make_tc(m_name.group(1).strip(), json.dumps(params, ensure_ascii=False))
-
     return None
 
 
@@ -345,13 +468,16 @@ def sse_chunk(
 
 
 # ══════════════════════════════════════════════════════════
-# BACKEND 1: Qwen
+# BACKEND 1: Qwen (مع دعم Proxy)
 # ══════════════════════════════════════════════════════════
 
 QWEN_BASE          = "https://chat.qwen.ai/api/v2"
 QWEN_MODEL_ID_REAL = "qwen3.8-max"
 QWEN_PROXY_ID      = "qwen"
 REQUEST_TIMEOUT    = 180
+
+# أكواد HTTP التي تعني حظر IP (ننتقل للبروكسي التالي)
+QWEN_BAN_CODES = {403, 429, 451}
 
 _UA_CHAT = (
     "Dalvik/2.1.0 (Linux; U; Android 15; RMX3834 Build/AP3A.240905.015.A2) "
@@ -407,10 +533,20 @@ def _qwen_is_antibot(line: str) -> bool:
     return "_____tmd_____" in line or "punish" in line
 
 
+def _make_qwen_client(proxy_url: Optional[str] = None) -> httpx.AsyncClient:
+    """إنشاء httpx client مع أو بدون proxy"""
+    if proxy_url:
+        return httpx.AsyncClient(proxies={"http://": proxy_url, "https://": proxy_url})
+    return httpx.AsyncClient()
+
+
 async def _qwen_create_chat(token: str, client: httpx.AsyncClient) -> str:
     url     = f"{QWEN_BASE}/chats/new"
     payload = {"chat_mode": "normal", "project_id": ""}
     resp    = await client.post(url, json=payload, headers=_qwen_headers_new(token), timeout=60)
+    # فحص حظر IP
+    if resp.status_code in QWEN_BAN_CODES:
+        raise BannedProxyError(f"HTTP {resp.status_code}")
     data    = resp.json()
     cid     = (data.get("chat_id") or data.get("id")
                or (data.get("data") or {}).get("chat_id")
@@ -418,6 +554,11 @@ async def _qwen_create_chat(token: str, client: httpx.AsyncClient) -> str:
     if not cid:
         raise HTTPException(status_code=502, detail=f"Failed to create Qwen chat: {data}")
     return cid
+
+
+class BannedProxyError(Exception):
+    """يُرفع عند حظر البروكسي (403/429/451)"""
+    pass
 
 
 def _qwen_build_payload(chat_id, prompt, parent_id, *, chat_type="t2t", thinking=False,
@@ -442,47 +583,73 @@ def _qwen_build_payload(chat_id, prompt, parent_id, *, chat_type="t2t", thinking
     }
 
 
-async def _qwen_stream_collect(token, chat_id, payload, client) -> Tuple[str, Optional[str]]:
+async def _qwen_stream_collect(
+    token: str,
+    chat_id: str,
+    payload: Dict,
+    client: httpx.AsyncClient,
+) -> Tuple[str, Optional[str], bool]:
+    """
+    يُرجع: (full_text, last_response_id, was_banned)
+    was_banned = True إذا تلقينا HTTP ban code
+    """
     url      = f"{QWEN_BASE}/chat/completions"
     full_txt = ""
     resp_id: Optional[str] = None
-    async with client.stream("POST", url, json=payload,
-                              headers=_qwen_headers_chat(token, stream=True),
-                              params={"chat_id": chat_id}, timeout=REQUEST_TIMEOUT) as resp:
-        async for raw_line in resp.aiter_lines():
-            if not raw_line:
-                continue
-            if _qwen_is_antibot(raw_line):
-                break
-            if _qwen_is_rate_limited(raw_line):
-                full_txt += "[ERROR: Rate limited]"
-                break
-            if not raw_line.startswith("data: "):
-                continue
-            ds = raw_line[6:].strip()
-            if ds == "[DONE]":
-                break
-            try:
-                obj = json.loads(ds)
-                if _qwen_is_rate_limited(obj):
+    was_banned = False
+
+    try:
+        async with client.stream(
+            "POST", url, json=payload,
+            headers=_qwen_headers_chat(token, stream=True),
+            params={"chat_id": chat_id}, timeout=REQUEST_TIMEOUT,
+        ) as resp:
+            # فحص حظر IP أولاً
+            if resp.status_code in QWEN_BAN_CODES:
+                log.warning("Qwen: HTTP %d → proxy banned", resp.status_code)
+                return "", None, True
+
+            async for raw_line in resp.aiter_lines():
+                if not raw_line:
+                    continue
+                if _qwen_is_antibot(raw_line):
+                    break
+                if _qwen_is_rate_limited(raw_line):
                     full_txt += "[ERROR: Rate limited]"
                     break
-                rid = (obj.get("response_id") or
-                       obj.get("choices", [{}])[0].get("delta", {}).get("response_id"))
-                if rid:
-                    resp_id = rid
-                choices = obj.get("choices", [])
-                if not choices:
+                if not raw_line.startswith("data: "):
                     continue
-                delta = choices[0].get("delta", {})
-                if delta.get("phase", "") not in ("answer", ""):
+                ds = raw_line[6:].strip()
+                if ds == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(ds)
+                    if _qwen_is_rate_limited(obj):
+                        full_txt += "[ERROR: Rate limited]"
+                        break
+                    rid = (obj.get("response_id") or
+                           obj.get("choices", [{}])[0].get("delta", {}).get("response_id"))
+                    if rid:
+                        resp_id = rid
+                    choices = obj.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    if delta.get("phase", "") not in ("answer", ""):
+                        continue
+                    content = delta.get("content", "")
+                    if content:
+                        full_txt += content
+                except (json.JSONDecodeError, KeyError, IndexError):
                     continue
-                content = delta.get("content", "")
-                if content:
-                    full_txt += content
-            except (json.JSONDecodeError, KeyError, IndexError):
-                continue
-    return full_txt, resp_id
+
+    except httpx.ProxyError as e:
+        log.warning("Qwen: ProxyError → %s (proxy connection failed)", e)
+        # خطأ اتصال بالبروكسي — لا يعني حظراً بالضرورة
+        # نُرجع نصاً فارغاً بدون علامة حظر
+        return "", None, False
+
+    return full_txt, resp_id, was_banned
 
 
 class QwenBackend(BaseBackend):
@@ -495,19 +662,56 @@ class QwenBackend(BaseBackend):
         if not prompt.strip():
             return
         await _evict_old_sessions()
-        sess = await _get_session(token, conv_id)
-        if sess:
-            qwen_chat_id = sess["qwen_chat_id"]
-            parent_id    = sess.get("parent_id")
-        else:
-            async with httpx.AsyncClient() as tmp:
-                qwen_chat_id = await _qwen_create_chat(token, tmp)
-            parent_id = None
-            await _set_session(token, conv_id, {"qwen_chat_id": qwen_chat_id, "parent_id": parent_id})
-        payload = _qwen_build_payload(qwen_chat_id, prompt, parent_id, thinking=thinking)
-        async with httpx.AsyncClient() as client:
-            qwen_text, last_rid = await _qwen_stream_collect(token, qwen_chat_id, payload, client)
-        await _update_session(token, conv_id, parent_id=last_rid)
+
+        # الحد الأقصى لمحاولات تبديل البروكسي
+        MAX_PROXY_RETRIES = 3
+
+        for attempt in range(MAX_PROXY_RETRIES + 1):
+            # جلب البروكسي الحالي للمحادثة
+            proxy_url = await proxy_manager.get_for_session(conv_id) if proxy_manager.enabled else None
+
+            sess = await _get_session(token, conv_id)
+            if sess:
+                qwen_chat_id = sess["qwen_chat_id"]
+                parent_id    = sess.get("parent_id")
+            else:
+                try:
+                    async with _make_qwen_client(proxy_url) as tmp:
+                        qwen_chat_id = await _qwen_create_chat(token, tmp)
+                except BannedProxyError:
+                    if proxy_url and attempt < MAX_PROXY_RETRIES:
+                        log.warning("Qwen: proxy banned during chat creation, switching")
+                        proxy_url = await proxy_manager.mark_banned(proxy_url, conv_id)
+                        continue
+                    yield sse_chunk("[Qwen Error: all proxies banned]", model=self.model_id)
+                    yield sse_chunk(model=self.model_id, finish=True)
+                    yield "data: [DONE]\n\n"
+                    return
+                parent_id = None
+                await _set_session(token, conv_id, {
+                    "qwen_chat_id": qwen_chat_id,
+                    "parent_id": parent_id,
+                    "qwen_proxy": proxy_url,
+                })
+
+            payload = _qwen_build_payload(qwen_chat_id, prompt, parent_id, thinking=thinking)
+
+            async with _make_qwen_client(proxy_url) as client:
+                qwen_text, last_rid, was_banned = await _qwen_stream_collect(
+                    token, qwen_chat_id, payload, client
+                )
+
+            if was_banned and proxy_url and attempt < MAX_PROXY_RETRIES:
+                # حظر IP → نبدل البروكسي ونعيد المحاولة بمحادثة جديدة
+                log.info("Qwen: switching proxy (attempt %d/%d)", attempt + 1, MAX_PROXY_RETRIES)
+                proxy_url = await proxy_manager.mark_banned(proxy_url, conv_id)
+                await _clear_session(token, conv_id)
+                continue
+
+            # نجاح أو انتهاء المحاولات
+            await _update_session(token, conv_id, parent_id=last_rid)
+            break
+
         tc = parse_tool_call(qwen_text)
         if tc:
             call_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -515,7 +719,7 @@ class QwenBackend(BaseBackend):
             yield sse_chunk(tc=tc, model=self.model_id, call_id=call_id, finish=True)
             yield "data: [DONE]\n\n"
         else:
-            txt = clean_text(qwen_text)
+            txt = clean_text(qwen_text) or "[Qwen: empty response]"
             for i in range(0, max(len(txt), 1), 40):
                 yield sse_chunk(txt[i:i+40], model=self.model_id)
             yield sse_chunk(model=self.model_id, finish=True)
@@ -526,7 +730,7 @@ register_backend(QwenBackend())
 
 
 # ══════════════════════════════════════════════════════════
-# BACKEND 2 & 3: DeepSeek
+# BACKEND 2 & 3: DeepSeek (مع Fallback ذكي)
 # ══════════════════════════════════════════════════════════
 
 DEEPSEEK_PROXY_ID_EXPERT  = "deepseek"
@@ -534,6 +738,24 @@ DEEPSEEK_PROXY_ID_DEFAULT = "deepseek-default"
 DEEPSEEK_CHAT_URL         = "https://chat.deepseek.com/api/v0/chat/completion"
 DEEPSEEK_SESSION_URL      = "https://chat.deepseek.com/api/v0/chat_session/create"
 RAILWAY_POW_URL           = "https://pow.up.railway.app/pow"
+
+# رسائل خطأ DeepSeek التي تعني "الخادم مشغول"
+DEEPSEEK_SERVER_BUSY_PATTERNS = [
+    "server is busy",
+    "الخادم مشغول",
+    "try again later",
+    "حاول مرة أخرى",
+    "use fast mode",
+    "السريع",
+    "overloaded",
+    "too many requests",
+    "rate limit",
+]
+
+def _ds_is_server_busy(text: str) -> bool:
+    """فحص إذا كان الخطأ يعني الخادم مشغول"""
+    lower = text.lower()
+    return any(p in lower for p in DEEPSEEK_SERVER_BUSY_PATTERNS)
 
 
 def _ds_rangers_id() -> str:
@@ -625,100 +847,138 @@ class DeepSeekBackend(BaseBackend):
 
         await _evict_old_sessions()
 
-        sess = await _get_session(token, conv_id)
-        async with httpx.AsyncClient() as client:
-            if sess:
-                session_id        = sess["ds_session_id"]
-                parent_message_id = sess.get("ds_parent_msg_id")
-                log.info("DeepSeek[%s]: reusing session=%s parent=%s",
-                         model_type, session_id, parent_message_id)
-            else:
-                session_id        = await _ds_create_session(token, client)
-                parent_message_id = None
-                await _set_session(token, conv_id, {
-                    "ds_session_id":    session_id,
-                    "ds_parent_msg_id": parent_message_id,
-                })
-                log.info("DeepSeek[%s]: new session=%s for conv=%s",
-                         model_type, session_id, conv_id)
+        # نحاول مرتين كحد أقصى (نفس الوضع + وضع مختلف)
+        # الإستراتيجية:
+        #   محاولة 1: إذا فشلت → محادثة جديدة، نفس الوضع
+        #   محاولة 2: إذا فشلت → محادثة جديدة، وضع مختلف
+        MAX_DS_RETRIES = 2
+        current_type = model_type
 
-            pow_response, pow_data = await _ds_get_pow(token, client)
+        for attempt in range(MAX_DS_RETRIES + 1):
+            sess = await _get_session(token, conv_id)
+            async with httpx.AsyncClient() as client:
+                if sess and attempt == 0:
+                    session_id        = sess["ds_session_id"]
+                    parent_message_id = sess.get("ds_parent_msg_id")
+                    log.info("DeepSeek[%s]: reusing session=%s parent=%s",
+                             current_type, session_id, parent_message_id)
+                else:
+                    # إنشاء محادثة جديدة
+                    if attempt > 0:
+                        log.info("DeepSeek: retry attempt=%d, creating new session, mode=%s",
+                                 attempt, current_type)
+                        await _clear_session(token, conv_id)
+                    session_id        = await _ds_create_session(token, client)
+                    parent_message_id = None
+                    await _set_session(token, conv_id, {
+                        "ds_session_id":    session_id,
+                        "ds_parent_msg_id": parent_message_id,
+                    })
+                    log.info("DeepSeek[%s]: new session=%s for conv=%s",
+                             current_type, session_id, conv_id)
 
-            payload = {
-                "chat_session_id":   session_id,
-                "parent_message_id": parent_message_id,
-                "prompt":            prompt,
-                "ref_file_ids":      [],
-                "thinking_enabled":  thinking,
-                "search_enabled":    search_enabled,
-                "model_type":        model_type,
-                "action":            None,
-                "preempt":           False,
-                "pow":               pow_data,
-                "stream":            True,
-            }
+                pow_response, pow_data = await _ds_get_pow(token, client)
 
-            headers   = _ds_headers(token, pow_response)
-            full_text = ""
-            thinking_text     = ""
-            new_parent_msg_id = None
+                payload = {
+                    "chat_session_id":   session_id,
+                    "parent_message_id": parent_message_id,
+                    "prompt":            prompt,
+                    "ref_file_ids":      [],
+                    "thinking_enabled":  thinking,
+                    "search_enabled":    search_enabled,
+                    "model_type":        current_type,
+                    "action":            None,
+                    "preempt":           False,
+                    "pow":               pow_data,
+                    "stream":            True,
+                }
 
-            try:
-                async with client.stream("POST", DEEPSEEK_CHAT_URL, json=payload,
-                                          headers=headers, timeout=REQUEST_TIMEOUT) as resp:
-                    first_done = False
-                    async for raw_line in resp.aiter_lines():
-                        if not raw_line or not raw_line.startswith("data: "):
-                            continue
-                        ds = raw_line[6:].strip()
-                        if ds == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(ds)
-                        except json.JSONDecodeError:
-                            continue
+                headers   = _ds_headers(token, pow_response)
+                full_text = ""
+                thinking_text     = ""
+                new_parent_msg_id = None
+                stream_error      = None
 
-                        if not first_done:
-                            req_id  = obj.get("request_message_id")
-                            resp_id = obj.get("response_message_id")
-                            if req_id and resp_id:
-                                new_parent_msg_id = resp_id
-                                first_done = True
+                try:
+                    async with client.stream("POST", DEEPSEEK_CHAT_URL, json=payload,
+                                              headers=headers, timeout=REQUEST_TIMEOUT) as resp:
+                        first_done = False
+                        async for raw_line in resp.aiter_lines():
+                            if not raw_line or not raw_line.startswith("data: "):
+                                continue
+                            ds = raw_line[6:].strip()
+                            if ds == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(ds)
+                            except json.JSONDecodeError:
                                 continue
 
-                        v = obj.get("v")
-                        p = obj.get("p", "")
-                        o = obj.get("o", "")
+                            if not first_done:
+                                req_id  = obj.get("request_message_id")
+                                resp_id = obj.get("response_message_id")
+                                if req_id and resp_id:
+                                    new_parent_msg_id = resp_id
+                                    first_done = True
+                                    continue
 
-                        if isinstance(v, str) and o == "APPEND" and "content" in p:
-                            full_text += v
-                            continue
+                            v = obj.get("v")
+                            p = obj.get("p", "")
+                            o = obj.get("o", "")
 
-                        if isinstance(v, dict):
-                            frags = (v.get("response") or {}).get("fragments", [])
-                            for frag in frags:
-                                ftype = frag.get("type", "")
-                                fcont = frag.get("content", "") or ""
-                                if ftype == "THINKING":
-                                    thinking_text += fcont
-                                elif ftype == "RESPONSE":
-                                    full_text += fcont
+                            if isinstance(v, str) and o == "APPEND" and "content" in p:
+                                full_text += v
+                                continue
 
-                        if isinstance(v, str) and not p:
-                            full_text += v
+                            if isinstance(v, dict):
+                                frags = (v.get("response") or {}).get("fragments", [])
+                                for frag in frags:
+                                    ftype = frag.get("type", "")
+                                    fcont = frag.get("content", "") or ""
+                                    if ftype == "THINKING":
+                                        thinking_text += fcont
+                                    elif ftype == "RESPONSE":
+                                        full_text += fcont
 
-            except Exception as e:
-                log.error("DeepSeek stream error: %s", e)
-                yield sse_chunk(f"[DeepSeek Error: {e}]", model=self.model_id)
-                yield sse_chunk(model=self.model_id, finish=True)
-                yield "data: [DONE]\n\n"
-                return
+                            if isinstance(v, str) and not p:
+                                full_text += v
+
+                except Exception as e:
+                    stream_error = str(e)
+                    log.error("DeepSeek stream error: %s", e)
+
+            # فحص إذا كان الخطأ "الخادم مشغول"
+            is_busy = (
+                stream_error and _ds_is_server_busy(stream_error)
+            ) or (
+                full_text and _ds_is_server_busy(full_text) and len(full_text) < 200
+            )
+
+            if is_busy and attempt < MAX_DS_RETRIES:
+                # تبديل الوضع في المحاولة الثانية
+                if attempt == 0:
+                    log.warning("DeepSeek: server busy, retrying with new session (same mode)")
+                elif attempt == 1:
+                    # تبديل expert ↔ default
+                    current_type = "default" if current_type == "expert" else "expert"
+                    log.warning("DeepSeek: server busy again, switching mode to %s", current_type)
+                await asyncio.sleep(1)
+                continue
+
+            # نجاح أو لا يوجد داعي للتكرار
+            break
 
         if new_parent_msg_id:
             await _update_session(token, conv_id, ds_parent_msg_id=new_parent_msg_id)
 
         log.info("DeepSeek[%s]: text=%d thinking=%d parent=%s",
-                 model_type, len(full_text), len(thinking_text), new_parent_msg_id)
+                 current_type, len(full_text), len(thinking_text), new_parent_msg_id)
+
+        if stream_error and not full_text:
+            yield sse_chunk(f"[DeepSeek Error: {stream_error}]", model=self.model_id)
+            yield sse_chunk(model=self.model_id, finish=True)
+            yield "data: [DONE]\n\n"
+            return
 
         if thinking_text:
             thinking_payload = json.dumps({"type": "thinking", "content": thinking_text}, ensure_ascii=False)
@@ -744,14 +1004,6 @@ register_backend(DeepSeekBackend(DEEPSEEK_PROXY_ID_DEFAULT, "default"))
 
 # ══════════════════════════════════════════════════════════
 # BACKEND 4: Gemini
-#
-# التوكن هنا = سلسلة كوكيز كاملة بصيغة:
-#   "KEY1=VAL1; KEY2=VAL2; ..."
-#
-# أو يمكن إرساله كـ JSON object محوّل إلى string.
-#
-# الـ USER_ACCOUNT و BL مضمّنان هنا — لا تحتاج تغييرهم
-# إلا إذا تغيّرت نسخة Gemini.
 # ══════════════════════════════════════════════════════════
 
 GEMINI_PROXY_ID   = "gemini"
@@ -770,21 +1022,17 @@ GEMINI_STREAM_URL = (
     f"{GEMINI_BASE_URL}/assistant.lamda.BardFrontendService/StreamGenerate"
 )
 
-# الكوكيز التي نتابع تحديثها تلقائياً من ردود الخادم
 GEMINI_TRACKED_COOKIES = {
     "SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC",
     "__Secure-1PSIDTS", "__Secure-3PSIDTS",
     "COMPASS", "_gcl_au", "_ga_WC57KJ50ZZ", "_ga_BF8Q35BMLM",
 }
 
-# مخزن كوكيز Gemini — مفصول تماماً عن sessions النماذج الأخرى
-# المفتاح: أول 64 حرف من cookie_string
 _gemini_cookie_store: Dict[str, Dict[str, str]] = {}
 _gemini_lock = asyncio.Lock()
 
 
 def _parse_cookie_string(cookie_str: str) -> Dict[str, str]:
-    """تحويل 'K1=V1; K2=V2' إلى dict"""
     result: Dict[str, str] = {}
     for part in cookie_str.split(";"):
         part = part.strip()
@@ -799,36 +1047,26 @@ def _cookies_to_string(cookies: Dict[str, str]) -> str:
 
 
 def _gemini_cookie_key(cookie_str: str) -> str:
-    """مفتاح فريد لمخزن الكوكيز بناءً على SID"""
     cookies = _parse_cookie_string(cookie_str)
-    # نستخدم أول 32 حرف من SID كمعرف
     sid = cookies.get("SID", cookie_str)
     return "gem_" + hashlib.md5(sid[:64].encode()).hexdigest()[:16]
 
 
 async def _gemini_get_cookies(cookie_key: str, initial_str: str) -> Dict[str, str]:
-    """إرجاع الكوكيز المحدّثة من المخزن، أو تحليل initial_str"""
     async with _gemini_lock:
         if cookie_key in _gemini_cookie_store:
             return dict(_gemini_cookie_store[cookie_key])
-        # أول استخدام — نحلل الـ string المُرسَل
         parsed = _parse_cookie_string(initial_str)
         _gemini_cookie_store[cookie_key] = parsed
         return dict(parsed)
 
 
 async def _gemini_update_cookies(cookie_key: str, response_cookies) -> None:
-    """تحديث الكوكيز المتغيرة من رد الخادم.
-    
-    httpx.Cookies لا تُرجع objects عند التكرار — تُرجع strings (أسماء).
-    لذا نستخدم .items() للحصول على (name, value) معاً.
-    """
     async with _gemini_lock:
         if cookie_key not in _gemini_cookie_store:
             return
         updated = []
         try:
-            # httpx.Cookies.items() يُرجع (name, value) tuples
             items = list(response_cookies.items())
         except Exception:
             return
@@ -865,28 +1103,15 @@ async def _gemini_get_tokens(
     client: httpx.AsyncClient,
     cookie_key: str,
 ) -> Tuple[Optional[str], Optional[str]]:
-    """جلب SNlM0e و FdrFJe من صفحة التطبيق.
-    
-    إصلاحات:
-    - نمرر الكوكيز عبر headers مباشرة (لا عبر httpx cookies= لأن Gemini
-      يتطلب الكوكيز بصيغة محددة في الـ Cookie header)
-    - نتتبع الـ redirects يدوياً لضمان إرسال الكوكيز مع كل طلب
-    - نسجّل status_code وطول الرد للتشخيص
-    """
     cookies_str = _cookies_to_string(cookies)
     headers = _gemini_headers(cookies_str)
-    # نحذف Content-Type من طلب GET
     headers.pop("content-type", None)
 
     try:
-        # نتتبع الـ redirects يدوياً لضمان إرسال الكوكيز في كل redirect
         url = GEMINI_APP_URL
-        for _ in range(5):  # حد أقصى 5 redirects
+        for _ in range(5):
             resp = await client.get(
-                url,
-                headers=headers,
-                timeout=30,
-                follow_redirects=False,
+                url, headers=headers, timeout=30, follow_redirects=False,
             )
             log.info("Gemini token fetch: status=%d url=%s body_len=%d",
                      resp.status_code, url, len(resp.text))
@@ -895,50 +1120,38 @@ async def _gemini_get_tokens(
                 location = resp.headers.get("location", "")
                 if not location:
                     break
-                # نُحوّل relative URL إلى absolute
                 if location.startswith("/"):
                     location = "https://gemini.google.com" + location
                 url = location
-                # تحديث الكوكيز من الـ redirect response
                 await _gemini_update_cookies(cookie_key, resp.cookies)
                 log.info("Gemini: redirect → %s", url[:80])
                 continue
             break
 
-        # تحديث الكوكيز من الرد النهائي
         await _gemini_update_cookies(cookie_key, resp.cookies)
 
         snlm0e = None
         fdrfje = None
 
-        # نجرب regex patterns متعددة لاستخراج SNlM0e
-        for pattern in [
-            r'"SNlM0e":"(.*?)"',
-            r"'SNlM0e':'(.*?)'",
-            r'SNlM0e["\s]*:["\s]*"([^"]+)"',
-        ]:
+        for pattern in [r'"SNlM0e":"(.*?)"', r"'SNlM0e':'(.*?)'",
+                         r'SNlM0e["\s]*:["\s]*"([^"]+)"']:
             q1 = re.search(pattern, resp.text)
             if q1:
                 snlm0e = q1.group(1)
                 break
 
-        for pattern in [
-            r'"FdrFJe":"([\d-]+)"',
-            r"'FdrFJe':'([\d-]+)'",
-            r'FdrFJe["\s]*:["\s]*"([\d-]+)"',
-        ]:
+        for pattern in [r'"FdrFJe":"([\d-]+)"', r"'FdrFJe':'([\d-]+)'",
+                         r'FdrFJe["\s]*:["\s]*"([\d-]+)"']:
             q2 = re.search(pattern, resp.text)
             if q2:
                 fdrfje = q2.group(1)
                 break
 
         if not snlm0e:
-            # سجّل أول 500 حرف من الرد للتشخيص
             log.error("Gemini: SNlM0e not found. Response preview: %s",
                       resp.text[:500].replace("\n", " "))
         else:
-            log.info("Gemini: tokens OK snlm0e=%s fdrfje=%s",
-                     snlm0e[:8], fdrfje)
+            log.info("Gemini: tokens OK snlm0e=%s fdrfje=%s", snlm0e[:8], fdrfje)
 
         return snlm0e, fdrfje
 
@@ -956,9 +1169,6 @@ async def _gemini_send_message(
     fdrfje:  str,
     gemini_conv: Optional[Dict],
 ) -> Tuple[str, Optional[Dict]]:
-    """إرسال رسالة لـ Gemini وإرجاع (full_text, updated_gemini_conv)"""
-
-    # بناء context المحادثة
     if gemini_conv is None:
         context = ["", "", "", None, None, None, None, None, None, ""]
     else:
@@ -997,9 +1207,9 @@ async def _gemini_send_message(
     h2["x-goog-ext-73010989-jspb"]  = "[0]"
     h2["x-goog-ext-73010990-jspb"]  = "[0,0,0]"
 
-    full_text      = ""
-    new_conv       = dict(gemini_conv) if gemini_conv else {}
-    new_at_token   = None
+    full_text    = ""
+    new_conv     = dict(gemini_conv) if gemini_conv else {}
+    new_at_token = None
 
     try:
         async with client.stream(
@@ -1017,7 +1227,6 @@ async def _gemini_send_message(
                         continue
                     if len(a1[0]) >= 3 and a1[0][2]:
                         c2 = json.loads(a1[0][2])
-                        # conversation_id / response_id
                         try:
                             if not new_conv.get("conversation_id"):
                                 conv_meta = c2[1]
@@ -1026,7 +1235,6 @@ async def _gemini_send_message(
                                     new_conv["response_id"]     = conv_meta[1]
                         except Exception:
                             pass
-                        # choice_id + نص الرد
                         try:
                             candidates = c2[4]
                             if candidates and candidates[0]:
@@ -1040,7 +1248,6 @@ async def _gemini_send_message(
                                         full_text = text
                         except Exception:
                             pass
-                        # at_token
                         try:
                             if isinstance(c2[3], dict):
                                 at_val = c2[3].get("26", "")
@@ -1061,54 +1268,28 @@ async def _gemini_send_message(
 
 
 class GeminiBackend(BaseBackend):
-    """
-    Backend يتحدث مع Gemini عبر كوكيز.
-
-    التوكن = سلسلة كوكيز كاملة (نفس ما يُرسَل كـ Cookie header)
-    مثال:
-        Authorization: Bearer "_ga=GA1....; SID=g.a000...; ..."
-
-    أو يمكن وضعها في ملف إعدادات وإرسال مفتاح فقط —
-    لكن الطريقة الأبسط هي إرسال الكوكيز كاملة كـ token.
-
-    المحادثة تحتفظ بـ:
-        - gemini_snlm0e  : يُجلب مرة واحدة لكل conv
-        - gemini_fdrfje  : يُجلب مرة واحدة لكل conv
-        - gemini_conv    : conversation_id, response_id, choice_id, at_token
-        - gemini_ck      : مفتاح مخزن الكوكيز
-    """
-
     @property
     def model_id(self) -> str:
         return GEMINI_PROXY_ID
 
-    async def complete(
-        self, token, messages, tools, thinking, conv_id, extra
-    ) -> AsyncIterator[str]:
-
-        # ── استخراج prompt ──────────────────────────────────────────
+    async def complete(self, token, messages, tools, thinking, conv_id, extra) -> AsyncIterator[str]:
         prompt = build_full_prompt(messages, tools)
         if not prompt.strip():
             return
 
         await _evict_old_sessions()
 
-        # ── مفتاح الكوكيز ───────────────────────────────────────────
         cookie_key = _gemini_cookie_key(token)
-
-        # ── جلب الجلسة أو إنشاؤها ───────────────────────────────────
         sess = await _get_session(token, conv_id)
 
         async with httpx.AsyncClient(verify=False, timeout=REQUEST_TIMEOUT) as client:
             if sess and sess.get("gemini_snlm0e"):
-                snlm0e    = sess["gemini_snlm0e"]
-                fdrfje    = sess["gemini_fdrfje"]
+                snlm0e      = sess["gemini_snlm0e"]
+                fdrfje      = sess["gemini_fdrfje"]
                 gemini_conv = sess.get("gemini_conv")
                 log.info("Gemini: reusing session conv=%s snlm0e=%s",
                          conv_id, snlm0e[:8] if snlm0e else "?")
             else:
-                # أول رسالة — نجلب التوكنات
-                # نتأكد أن cookie_key موجود في المخزن أولاً
                 cookies = await _gemini_get_cookies(cookie_key, token)
                 log.info("Gemini: fetching tokens, cookies=%d keys", len(cookies))
                 snlm0e, fdrfje = await _gemini_get_tokens(cookies, client, cookie_key)
@@ -1130,22 +1311,16 @@ class GeminiBackend(BaseBackend):
                 })
                 log.info("Gemini: new session conv=%s snlm0e=%s", conv_id, snlm0e[:8])
 
-            # ── إرسال الرسالة (نجلب الكوكيز المحدّثة من المخزن) ────────
-            # المخزن قد يحتوي كوكيز محدّثة من استدعاء get_tokens
             cookies = await _gemini_get_cookies(cookie_key, token)
-            log.info("Gemini: sending message, conv_id=%s cookies=%d",
-                     conv_id, len(cookies))
+            log.info("Gemini: sending message, conv_id=%s cookies=%d", conv_id, len(cookies))
             full_text, updated_conv = await _gemini_send_message(
                 cookies, client, cookie_key,
                 prompt, snlm0e, fdrfje, gemini_conv,
             )
 
-        # ── تحديث الجلسة ─────────────────────────────────────────────
         await _update_session(token, conv_id, gemini_conv=updated_conv)
-
         log.info("Gemini: text=%d chars", len(full_text))
 
-        # ── بث الرد بصيغة OpenAI ─────────────────────────────────────
         tc = parse_tool_call(full_text)
         if tc:
             call_id = f"call_{uuid.uuid4().hex[:24]}"
@@ -1228,7 +1403,7 @@ def _request_hash(messages: List[Dict], tools: List[Dict]) -> str:
 # FastAPI App
 # ══════════════════════════════════════════════════════════
 
-app = FastAPI(title="Universal AI Proxy", version="8.0.0", docs_url="/docs")
+app = FastAPI(title="Universal AI Proxy", version="9.0.0", docs_url="/docs")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -1241,21 +1416,29 @@ def _extract_token(authorization: Optional[str]) -> str:
 
 @app.get("/", tags=["health"])
 async def health():
+    pm = proxy_manager
     return {
-        "status": "ok", "proxy": "Universal AI Proxy", "version": "8.0.0",
+        "status": "ok", "proxy": "Universal AI Proxy", "version": "9.0.0",
         "active_sessions": len(_sessions),
         "gemini_cookie_keys": len(_gemini_cookie_store),
         "backends": list(_BACKENDS.keys()),
+        "proxy_config": {
+            "enabled": pm.enabled,
+            "total": len(pm._proxies),
+            "banned": len(pm._banned),
+            "available": len(pm._available()),
+        },
         "models": {
-            "qwen":             "Qwen3.8-max via chat.qwen.ai",
-            "deepseek":         "DeepSeek Expert via chat.deepseek.com",
-            "deepseek-default": "DeepSeek Default (fast) via chat.deepseek.com",
+            "qwen":             "Qwen3.8-max via chat.qwen.ai (with proxy rotation)",
+            "deepseek":         "DeepSeek Expert (auto-fallback on busy)",
+            "deepseek-default": "DeepSeek Default (auto-fallback on busy)",
             "gemini":           "Gemini via gemini.google.com (cookies-based)",
         },
-        "notes": [
-            "v8: Gemini backend added — send cookies string as Bearer token",
-            "v8: Each model uses its own token/cookies — no cross-contamination",
-            "v7: conv_id anchored to first message (stable across turns)",
+        "new_in_v9": [
+            "DeepSeek: auto-retry on server busy (new session → switch mode)",
+            "Regenerate: clears session for fresh conversation",
+            "Qwen: proxy rotation on ban (403/429 only, not on connection errors)",
+            "Proxy: sticky per session, same-country rotation",
         ],
     }
 
@@ -1292,6 +1475,15 @@ async def chat_completions(
         or request.headers.get("x-session-id")
     )
     conv_id = _compute_conv_id(messages, explicit_conv_id)
+
+    # ── Regenerate: حذف الجلسة لإنشاء محادثة جديدة ──────────────────
+    if _is_regenerate_request(body):
+        log.info("Regenerate detected for conv=%s, clearing session", conv_id[:16])
+        await _clear_session(token, conv_id)
+        # إعادة تعيين البروكسي أيضاً (للتنويع)
+        if proxy_manager.enabled:
+            async with proxy_manager._lock:
+                proxy_manager._session_proxy.pop(conv_id, None)
 
     log.info("conv=%s model=%s msgs=%d thinking=%s extra=%s",
              conv_id, model, len(messages), thinking, extra)
@@ -1359,7 +1551,10 @@ async def image_generations(request: Request, authorization: Optional[str] = Hea
     size   = body.get("size", "1:1").replace("x", ":")
     if not prompt:
         raise HTTPException(status_code=400, detail="'prompt' is required.")
-    async with httpx.AsyncClient() as client:
+
+    proxy_url = await proxy_manager.get_for_session("img_gen") if proxy_manager.enabled else None
+
+    async with _make_qwen_client(proxy_url) as client:
         cid     = await _qwen_create_chat(token, client)
         payload = _qwen_build_payload(cid, prompt, None, chat_type="t2i", size=size)
         image_url: Optional[str] = None
@@ -1384,127 +1579,6 @@ async def image_generations(request: Request, authorization: Optional[str] = Hea
     if not image_url:
         raise HTTPException(status_code=500, detail="No image URL returned.")
     return JSONResponse({"created": int(time.time()), "data": [{"url": image_url}]})
-
-
-# ══════════════════════════════════════════════════════════
-# Image Edits (Qwen)
-# ══════════════════════════════════════════════════════════
-
-OSS_UPLOAD_TIMEOUT = 120
-
-
-def _oss_sig(secret, method, md5, ct, date, canon_hdr, canon_res):
-    s2s    = f"{method}\n{md5}\n{ct}\n{date}\n{canon_hdr}{canon_res}"
-    digest = hmac.new(secret.encode(), s2s.encode(), hashlib.sha1).digest()
-    return base64.b64encode(digest).decode()
-
-
-async def _upload_image(token: str, image_bytes: bytes, client: httpx.AsyncClient) -> Dict:
-    filename  = f"{uuid.uuid4()}_IMG.jpg"
-    file_size = str(len(image_bytes))
-    sts = await client.post(
-        "https://chat.qwen.ai/api/v2/files/getstsToken",
-        json={"filename": filename, "filetype": "image", "filesize": file_size},
-        headers=_qwen_headers_chat(token), timeout=60,
-    )
-    res = sts.json()
-    if _qwen_is_rate_limited(res) or "data" not in res:
-        raise HTTPException(status_code=429, detail="Rate-limited during OSS STS.")
-    d      = res["data"]
-    aki    = d["access_key_id"]; aks = d["access_key_secret"]; stkn = d["security_token"]
-    fpath  = d["file_path"]; fid = d["file_id"]; bucket = d["bucketname"]
-    host   = f"{bucket}.{d['endpoint']}"
-    furl   = d.get("file_url", f"https://{host}/{fpath}")
-    oss_ua = "aliyun-sdk-android/2.9.21"
-    c_hdr  = f"x-oss-security-token:{stkn}\n"
-
-    def _oh(method, md5, ct, res_path, extra=None):
-        gmt = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
-        sig = _oss_sig(aks, method, md5, ct, gmt, c_hdr, res_path)
-        h   = {"Authorization": f"OSS {aki}:{sig}", "User-Agent": oss_ua, "Host": host,
-                "x-oss-security-token": stkn, "Date": gmt, "Content-Type": ct}
-        if extra:
-            h.update(extra)
-        return h
-
-    init_r    = await client.post(f"https://{host}/{fpath}?uploads",
-                                   headers=_oh("POST", "", "image/jpeg",
-                                               f"/{bucket}/{fpath}?uploads",
-                                               {"Content-Length": "0"}), timeout=60)
-    upload_id = ET.fromstring(init_r.text).find("{*}UploadId").text
-    cmd5      = base64.b64encode(hashlib.md5(image_bytes).digest()).decode()
-    part_r    = await client.put(
-        f"https://{host}/{fpath}?uploadId={upload_id}&partNumber=1", content=image_bytes,
-        headers=_oh("PUT", cmd5, "image/jpeg",
-                    f"/{bucket}/{fpath}?partNumber=1&uploadId={upload_id}",
-                    {"Content-MD5": cmd5, "Content-Length": file_size}),
-        timeout=OSS_UPLOAD_TIMEOUT,
-    )
-    etag = part_r.headers.get("ETag", "").replace('"', "")
-    body = (f"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber>"
-            f"<ETag>{etag}</ETag></Part></CompleteMultipartUpload>").encode()
-    await client.post(f"https://{host}/{fpath}?uploadId={upload_id}", content=body,
-                       headers=_oh("POST", "", "image/jpeg",
-                                   f"/{bucket}/{fpath}?uploadId={upload_id}",
-                                   {"Content-Length": str(len(body))}), timeout=60)
-    return {"type": "image", "file": {"data": {}, "filename": filename, "id": fid,
-                                       "meta": {"name": filename}},
-            "id": fid, "filename": filename, "name": filename, "url": furl,
-            "image_width": 1024, "image_height": 1024}
-
-
-@app.post("/v1/images/edits", tags=["images"])
-async def image_edits(request: Request, authorization: Optional[str] = Header(None)):
-    token       = _extract_token(authorization)
-    image_bytes = None
-    prompt      = ""
-    if "multipart/form-data" in request.headers.get("content-type", ""):
-        form      = await request.form()
-        prompt    = str(form.get("prompt", ""))
-        img_field = form.get("image")
-        if img_field and hasattr(img_field, "read"):
-            image_bytes = await img_field.read()
-    else:
-        body      = await request.json()
-        prompt    = body.get("prompt", "")
-        image_url = body.get("image_url", "")
-        if image_url:
-            async with httpx.AsyncClient() as dl:
-                r = await dl.get(image_url, timeout=60)
-                image_bytes = r.content
-    if not image_bytes:
-        raise HTTPException(status_code=400, detail="No image provided.")
-    if not prompt:
-        raise HTTPException(status_code=400, detail="'prompt' is required.")
-    async with httpx.AsyncClient() as client:
-        uploaded   = await _upload_image(token, image_bytes, client)
-        file_entry = {"type": "image", "file": uploaded["file"], "id": uploaded["id"],
-                       "url": uploaded["url"], "name": uploaded["filename"],
-                       "image_width": 1024, "image_height": 1024}
-        cid        = await _qwen_create_chat(token, client)
-        payload    = _qwen_build_payload(cid, prompt, None, chat_type="t2i", files=[file_entry])
-        result_url: Optional[str] = None
-        async with client.stream("POST", f"{QWEN_BASE}/chat/completions", json=payload,
-                                  headers=_qwen_headers_chat(token, stream=True),
-                                  params={"chat_id": cid}, timeout=300) as resp:
-            async for raw_line in resp.aiter_lines():
-                if not raw_line or not raw_line.startswith("data: "):
-                    continue
-                ds = raw_line[6:].strip()
-                if ds == "[DONE]":
-                    break
-                if _qwen_is_antibot(raw_line) or _qwen_is_rate_limited(raw_line):
-                    raise HTTPException(status_code=429, detail="Qwen blocked.")
-                try:
-                    obj     = json.loads(ds)
-                    content = obj["choices"][0].get("delta", {}).get("content", "")
-                    if content.startswith("http"):
-                        result_url = content
-                except Exception:
-                    continue
-    if not result_url:
-        raise HTTPException(status_code=500, detail="No edited image URL returned.")
-    return JSONResponse({"created": int(time.time()), "data": [{"url": result_url}]})
 
 
 # ══════════════════════════════════════════════════════════
@@ -1533,36 +1607,5 @@ async def _generic_err(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    log.info("Starting Universal AI Proxy v8.0 on port %d", port)
+    log.info("Starting Universal AI Proxy v9.0 on port %d", port)
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
-
-
-# ══════════════════════════════════════════════════════════
-# ملخص الاستخدام v8.0
-# ══════════════════════════════════════════════════════════
-#
-# ① Qwen:
-#    Authorization: Bearer <qwen_token>
-#    {"model": "qwen", "messages": [...]}
-#
-# ② DeepSeek Expert:
-#    Authorization: Bearer <deepseek_token>
-#    {"model": "deepseek", "messages": [...]}
-#
-# ③ DeepSeek Default:
-#    Authorization: Bearer <deepseek_token>
-#    {"model": "deepseek-default", "messages": [...]}
-#
-# ④ Gemini:
-#    Authorization: Bearer "_ga=GA1....; SID=g.a000...; __Secure-1PSID=..."
-#    {"model": "gemini", "messages": [...]}
-#
-#    الـ token لـ Gemini = الكوكيز كاملة بصيغة string واحدة
-#    (نفس ما يظهر في INITIAL_COOKIES بعد دمجه بـ "; ")
-#
-#    الكوكيز المتغيرة (SIDCC وما يشبهها) تُحدَّث تلقائياً
-#    في الذاكرة مع كل رد — لا تحتاج تحديثها يدوياً.
-#
-#    إذا انتهت صلاحية الكوكيز → أرسل الكوكيز الجديدة كـ token
-#    وسيبدأ البروكسي جلسة جديدة تلقائياً.
-# ══════════════════════════════════════════════════════════
